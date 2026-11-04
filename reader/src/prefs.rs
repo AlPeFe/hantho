@@ -48,8 +48,7 @@ impl Prefs {
 
     pub fn save(&self) {
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::create_dir_all(paths::home());
-            let _ = std::fs::write(paths::prefs_file(), json);
+            let _ = paths::write_atomic(&paths::prefs_file(), &json);
         }
     }
 

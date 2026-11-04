@@ -73,6 +73,23 @@ pub fn http_cache() -> PathBuf {
     home().join("cache").join("api")
 }
 
+/// Escribe a un temporal y renombra: un corte a mitad no deja el archivo corrupto.
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Capítulos por leer de los favoritos, según la última comprobación.
+pub fn news_file() -> PathBuf {
+    home().join("new_chapters.json")
+}
+
 /// Qué capítulos se han descargado y dónde.
 pub fn downloads_file() -> PathBuf {
     home().join("downloads.json")

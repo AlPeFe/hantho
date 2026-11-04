@@ -16,6 +16,7 @@ use crate::host::{Host, LoadedSource};
 use crate::library::{AniListLink, LastRead, Library, Status};
 use crate::theme::{self, ERROR, FAINT, LAVENDER, MINT, MUTED, ON_PINK, PEACH, PINK, PINK_DIM, TEXT};
 use crate::model::{Chapter, Manga, MangaDetails, Page};
+use crate::news::{self, News};
 use crate::paths;
 use crate::prefs::{self, Prefs};
 use crate::render::{self, Encoded, Fit, View};
@@ -49,7 +50,8 @@ enum Msg {
     /// Paso de animación (~20 por segundo).
     Tick,
     Resize,
-    HostReady(Result<(Arc<Host>, Vec<LoadedSource>, usize)>),
+    /// El host, sus fuentes y las extensiones que no han cargado (nombre, error).
+    HostReady(Result<(Arc<Host>, Vec<LoadedSource>, Vec<(String, String)>)>),
     Search(u64, SearchEvent),
     Details(u64, Result<MangaDetails>),
     Pages(u64, Result<Vec<Page>>),
@@ -74,6 +76,7 @@ enum Msg {
     /// fuente de la versión anterior (para quitarlas).
     Upgraded(Vec<Installed>, Vec<LoadedSource>, Vec<String>, Vec<String>),
     Download(download::Event),
+    News(news::Event),
 }
 
 /// Una página descargada. En modo Sixel se codifica con nuestro render (`render.rs`) para el
@@ -349,6 +352,12 @@ struct App {
     download_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     download_progress: Option<String>,
 
+    /// Capítulos por leer de los favoritos (`u` en la biblioteca).
+    news: News,
+    news_busy: bool,
+    /// Extensiones que no han cargado: (nombre, error).
+    load_errors: Vec<(String, String)>,
+
     backup_files: Vec<std::path::PathBuf>,
     backup_state: ListState,
     backup_busy: bool,
@@ -473,6 +482,9 @@ impl App {
             download_queue: VecDeque::new(),
             download_cancel: None,
             download_progress: None,
+            news: News::load(),
+            news_busy: false,
+            load_errors: Vec::new(),
             backup_files: Vec::new(),
             backup_state: ListState::default(),
             backup_busy: false,
@@ -491,6 +503,7 @@ impl App {
 
     async fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         spawn_input(self.tx.clone());
+        tokio::task::spawn_blocking(crate::cache::sweep);
         let tick_tx = self.tx.clone();
         tokio::spawn(async move {
             let mut every = tokio::time::interval(Duration::from_millis(50));
@@ -503,7 +516,7 @@ impl App {
             let res = async {
                 let host = Host::spawn().await?;
                 let (sources, errors) = host.load_all(&crate::ext::list()).await;
-                Ok((host, sources, errors.len()))
+                Ok((host, sources, errors))
             }
             .await;
             let _ = tx.send(Msg::HostReady(res));
@@ -560,8 +573,10 @@ impl App {
             Msg::Key(key) => self.on_key(key),
             Msg::Resize => self.clear = true,
             Msg::HostReady(Ok((host, sources, errors))) => {
+                let failed = errors.len();
                 self.status = trf!("{} fuentes listas", "{} sources ready", sources.len())
-                    + &if errors > 0 { trf!(" ({errors} extensiones no han cargado)", " ({errors} extensions failed to load)") } else { String::new() };
+                    + &if failed > 0 { trf!(" ({failed} extensiones no han cargado: míralo en Extensiones)", " ({failed} extensions failed to load: see Extensions)") } else { String::new() };
+                self.load_errors = errors;
                 if sources.is_empty() {
                     self.status = tr!("no hay extensiones: añádelas desde «Añadir extensiones» en el menú", "no extensions yet: add them from “Add extensions” in the menu").into();
                 }
@@ -716,6 +731,7 @@ impl App {
                 match res {
                     Ok((ext, sources)) => {
                         self.status = trf!("✓ {} instalada · {} fuentes nuevas", "✓ {} installed · {} new sources", ext.name, sources.len());
+                        self.load_errors.retain(|(name, _)| *name != ext.name);
                         self.sources.retain(|s| !sources.iter().any(|n| n.info.id == s.info.id));
                         self.sources.extend(sources);
                         self.installed = crate::ext::list();
@@ -738,6 +754,7 @@ impl App {
             Msg::Updates(Err(_)) => {}
             Msg::Upgraded(installed, sources, errors, old_ids) => {
                 self.upgrading = false;
+                self.load_errors.retain(|(name, _)| !installed.iter().any(|i| i.name == *name));
                 self.sources.retain(|s| !old_ids.contains(&s.info.id));
                 self.sources.extend(sources);
                 self.installed = crate::ext::list();
@@ -748,6 +765,7 @@ impl App {
                 }
             }
             Msg::Download(event) => self.on_download_event(event),
+            Msg::News(event) => self.on_news_event(event),
             Msg::AutoLink(source_id, url, title, res) => self.on_auto_link(&source_id, &url, &title, res),
             Msg::AnilistLogin(res) => {
                 self.anilist_login = false;
@@ -1083,6 +1101,7 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => select_prev(&mut self.library_state),
             KeyCode::Down | KeyCode::Char('j') => select_next(&mut self.library_state, len),
+            KeyCode::Char('u') => self.check_news(),
             KeyCode::Char('d') | KeyCode::Delete => {
                 let Some(i) = self.library_state.selected().filter(|&i| i < len) else { return };
                 let fav = self.library.favorites.remove(i);
@@ -1296,6 +1315,48 @@ impl App {
                     self.start_search();
                 } else if self.pending == 0 {
                     self.search_more();
+                }
+            }
+        }
+    }
+
+    /// Busca capítulos nuevos en lo que se está leyendo.
+    fn check_news(&mut self) {
+        if self.news_busy {
+            return;
+        }
+        let Some(host) = self.host.clone() else {
+            self.status = tr!("esperando a que carguen las extensiones…", "waiting for extensions to load…").into();
+            return;
+        };
+        self.news_busy = true;
+        self.status = tr!("comprobando capítulos nuevos…", "checking for new chapters…").into();
+        let loaded = self.sources.iter().map(|s| s.info.id.clone()).collect();
+        let mut rx = news::check(host, self.library.favorites.clone(), loaded);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if tx.send(Msg::News(event)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn on_news_event(&mut self, event: news::Event) {
+        match event {
+            news::Event::Found { .. } | news::Event::Failed { .. } => {}
+            news::Event::Progress { done, total } => {
+                self.news = News::load();
+                self.status = trf!("comprobando capítulos nuevos… {done}/{total}", "checking for new chapters… {done}/{total}");
+            }
+            news::Event::Done { checked, failed, skipped } => {
+                self.news_busy = false;
+                self.news = News::load();
+                let with_news = self.library.favorites.iter().filter(|f| self.news.count(f, &self.reads) > 0).count();
+                self.status = trf!("{with_news} mangas con capítulos por leer · {checked} comprobados", "{with_news} manga with chapters to read · {checked} checked");
+                if failed + skipped > 0 {
+                    self.status = trf!("{} · {failed} fallidos · {skipped} omitidos", "{} · {failed} failed · {skipped} skipped", self.status);
                 }
             }
         }
@@ -1602,6 +1663,7 @@ impl App {
             }
             // Con zoom o ajuste al ancho, las flechas primero recorren la página y al llegar al
             // borde pasan de página (como un webtoon)
+            KeyCode::Char('r') if r.error.is_some() => self.retry_reader(),
             KeyCode::Down | KeyCode::Char('j') => self.scroll_or_turn(Axis::Y, 0.35, true),
             KeyCode::Up | KeyCode::Char('k') => self.scroll_or_turn(Axis::Y, 0.35, false),
             KeyCode::Char(' ') | KeyCode::PageDown => self.scroll_or_turn(Axis::Y, 0.9, true),
@@ -2276,6 +2338,23 @@ impl App {
         });
     }
 
+    /// Vuelve a pedir lo que ha fallado: la página actual o, si ni siquiera hay lista, el capítulo.
+    fn retry_reader(&mut self) {
+        let Some(r) = self.reader.as_mut() else { return };
+        if r.pages.is_empty() {
+            let (chapter, page) = (r.chapter, r.page);
+            self.open_chapter(chapter);
+            if let Some(r) = self.reader.as_mut() {
+                r.page = page;
+            }
+        } else {
+            r.error = None;
+            let page = r.page;
+            r.requested.remove(&page);
+            self.prefetch();
+        }
+    }
+
     fn page_changed(&mut self) {
         self.clear = true;
         if let Some(r) = self.reader.as_mut() {
@@ -2481,11 +2560,16 @@ impl App {
                         Some(_) if fav.needs_sync() => Span::raw(" ↻").fg(PEACH),
                         Some(_) => Span::raw(" ✓").fg(MINT),
                     };
-                    ListItem::new(Line::from(vec![
+                    let mut spans = vec![
                         Span::raw(fav.manga.title.clone()).fg(TEXT),
                         Span::raw(trf!("  cap. {}", "  ch. {}", fav.progress)).fg(MUTED),
                         sync,
-                    ]))
+                    ];
+                    let new = self.news.count(fav, &self.reads);
+                    if new > 0 {
+                        spans.push(Span::raw(format!("  +{new}")).fg(PEACH).bold());
+                    }
+                    ListItem::new(Line::from(spans))
                 })
                 .collect();
             f.render_stateful_widget(
@@ -2497,7 +2581,7 @@ impl App {
                 f.render_widget(favorite_card(fav), card_area);
             }
         }
-        theme::status_bar(f, status_area, tr!("BIBLIOTECA", "LIBRARY"), &self.status, &[("enter", tr!("abrir", "open")), ("d", tr!("quitar", "remove")), ("/", tr!("buscar", "search")), ("esc", tr!("menú", "menu"))]);
+        theme::status_bar(f, status_area, tr!("BIBLIOTECA", "LIBRARY"), &self.status, &[("enter", tr!("abrir", "open")), ("u", tr!("capítulos nuevos", "new chapters")), ("d", tr!("quitar", "remove")), ("/", tr!("buscar", "search")), ("esc", tr!("menú", "menu"))]);
     }
 
     fn draw_extensions(&mut self, f: &mut Frame) {
@@ -2511,7 +2595,9 @@ impl App {
                     2 => (tr!("mixto", "mixed"), PEACH),
                     _ => (tr!("apto", "safe"), MINT),
                 };
-                let loaded = self.sources.iter().any(|s| s.info.name == e.name);
+                // Una extensión puede tener varias fuentes con otros nombres: lo que cuenta es si ha fallado
+                let error = self.load_errors.iter().find(|(name, _)| *name == e.name).map(|(_, error)| error);
+                let loaded = self.host.is_some() && error.is_none();
                 let mut spans = vec![
                     Span::raw(if loaded { "● " } else { "○ " }).fg(if loaded { MINT } else { FAINT }),
                     Span::raw(format!("{:<34}", e.name)).fg(TEXT),
@@ -2521,6 +2607,9 @@ impl App {
                 ];
                 if let Some(new) = self.updates.iter().find(|u| u.package_name == e.pkg) {
                     spans.push(Span::raw(format!("  ↑ {}", new.version_name)).fg(PEACH));
+                }
+                if let Some(error) = error {
+                    spans.push(Span::raw(format!("  ✕ {}", search::short_error(error))).fg(ERROR));
                 }
                 ListItem::new(Line::from(spans))
             })
@@ -3122,6 +3211,7 @@ impl App {
         let view = r.view;
         let page = r.images.get_mut(&r.page);
         let ready = page.as_ref().is_some_and(|p| !sixel || p.encoded.as_ref().is_some_and(|((s, _), _)| *s == size));
+        let has_error = r.error.is_some();
         if let Some(err) = &r.error {
             f.render_widget(Paragraph::new(format!("✕ {err}")).fg(ERROR).wrap(Wrap { trim: true }).centered(), image_area);
         } else if let (true, Some(page)) = (ready, page) {
@@ -3154,7 +3244,12 @@ impl App {
                 center,
             );
         }
-        theme::status_bar(f, status_area, tr!("LEYENDO", "READING"), &info, &[("←→", tr!("página", "page")), ("n/p", tr!("capítulo", "chapter")), ("f", tr!("ajuste", "fit")), ("+/-", "zoom"), ("esc", tr!("volver", "back"))]);
+        let keys = if has_error {
+            vec![("r", tr!("reintentar", "retry")), ("←→", tr!("página", "page")), ("n/p", tr!("capítulo", "chapter")), ("esc", tr!("volver", "back"))]
+        } else {
+            vec![("←→", tr!("página", "page")), ("n/p", tr!("capítulo", "chapter")), ("f", tr!("ajuste", "fit")), ("+/-", "zoom"), ("esc", tr!("volver", "back"))]
+        };
+        theme::status_bar(f, status_area, tr!("LEYENDO", "READING"), &info, &keys);
     }
 }
 
@@ -3309,6 +3404,40 @@ mod tests {
         app.screen = Screen::Manga;
         app.update(Msg::Details(app.generation, Ok(MangaDetails { manga, chapters })));
         app
+    }
+
+    #[test]
+    fn extensions_show_why_they_failed_to_load() {
+        let mut app = App::new(Picker::halfblocks());
+        app.installed = vec![Installed { pkg: "p".into(), name: "Rota".into(), version_code: 1, version_name: "1.0".into(), content_warning: 1, langs: vec!["es".into()] }];
+        app.load_errors = vec![("Rota".into(), "java.lang.NoClassDefFoundError: android/webkit/Foo".into())];
+        app.screen = Screen::Extensions;
+        let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("✕") && text.contains("Android"), "{text}");
+    }
+
+    #[test]
+    fn retry_asks_again_for_the_failed_page() {
+        let mut app = App::new(Picker::halfblocks());
+        app.screen = Screen::Reader;
+        app.reader = Some(Reader {
+            source: test_source("a"),
+            manga_url: "/m".into(),
+            manga: test_manga("M"),
+            chapters: vec![Chapter { url: "/c".into(), ..Default::default() }],
+            chapter: 0,
+            pages: vec![serde_json::from_str(r#"{"index":0,"url":"/p"}"#).unwrap()],
+            page: 0,
+            requested: HashSet::from([0]),
+            images: HashMap::new(),
+            error: Some("error".into()),
+            view: View::default(),
+        });
+        app.key_reader(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        let r = app.reader.as_ref().unwrap();
+        assert!(r.error.is_none() && !r.requested.contains(&0));
     }
 
     #[test]

@@ -48,6 +48,7 @@ progress to [AniList](https://anilist.co).
 - ⬇ **Downloads**: saves chapters as `.cbz` files or image folders to a local folder, a network drive or an
   [rclone](https://rclone.org) remote (SFTP, WebDAV, S3, Google Drive…). Slowly, to go easy on the sources.
 - 💗 **Library**: favorites, reading status (reading, paused, completed…), "continue" where you left off.
+  `u` checks for new chapters in what you're reading and marks how many are left (`+3`).
 - ✓ **Read chapters**: marked automatically when you finish a chapter and dimmed in the list; for manga
   with a thousand chapters, filter (`/`), jump to a number (`#`) or move a hundred at a time.
 - 🧩 **Extensions**: like Mihon, Han Thỏ ships none. Add the repository you want, then in
@@ -167,6 +168,7 @@ From the command line, without the TUI:
 | Command | What it does |
 |---|---|
 | `hantho search "grand blue" [--lang en] [--all]` | Search installed sources (`--all`: all of them, no batches, also those skipped for failing) |
+| `hantho updates` | Check for new chapters in the manga you're reading |
 | `hantho download "title" --chapter N \| --from N --until M \| --unread \| --all [--dest D] [--format cbz\|folder] [--force]` | Download chapters (also with `--source` and `--url`) |
 | `hantho ext repo add\|remove <url>` / `ext repo list` | Manage your extension repositories |
 | `hantho ext update` | Download the latest catalog from your repositories and say if there are new versions |
@@ -189,14 +191,14 @@ Every list supports `↑`/`↓` and `k`/`j`; `esc` or `q` goes back; `ctrl+c` qu
 | Home | `1`–`7` or `enter` choose · `/` search · `q` quit |
 | Extensions | `U` update every one with a new version · `a` add more. The TUI checks for new versions on startup (downloading the catalog if it's over a day old) and shows it in the menu |
 | Add extensions | `enter` install, update or remove · `/` filter · `l` language · `n` hide NSFW · `r` add repository · `u` update catalog |
-| Library | `enter` open · `d` remove · `/` search |
+| Library | `enter` open · `u` check for new chapters · `d` remove · `/` search |
 | Search | type and press `enter` · `tab`/`↓` go to results · `/` edit · `b` library · `f` sources that failed · `m` search the next batch of sources · `ctrl+L` (or `l` outside the box) source language: system language + English by default; remembered |
 | Sources with problems | `r` retry · `R` retry all · `d` enable or disable · `U` update extensions |
 | Manga | `enter` read · `s` look for it in other sources · `d` download the chapter · `D` download all visible ones still missing (asks for the destination; `tab` changes the format) · `X` cancel the download · `c` continue · `f` favorite · `e` status · `a` link/sync AniList · `A` re-link · `r` reload (waits longer) |
 | Chapters | `m` mark/unmark read · `M` mark this one and all before · `/` filter · `#` go to chapter N · `[`/`]` ±100 · `g`/`G` first/last · `o` reverse order |
 | Mihon backup | `enter` export, or import the selected file · `r` look for files again |
 | AniList | `l` log in · `o` log out · `d` register the app (only if the client ID is missing) |
-| Reader | `→` `space` `l` next · `←` `h` previous · `n`/`p` next/previous chapter · `g`/`G` first/last page · `f` fit (page, width, height, original; remembered per manga) · `+`/`-` zoom · `0` reset zoom. When the page doesn't fit, the arrows (`hjkl`) scroll it first and turn the page at the edge |
+| Reader | `→` `space` `l` next · `←` `h` previous · `n`/`p` next/previous chapter · `g`/`G` first/last page · `f` fit (page, width, height, original; remembered per manga) · `+`/`-` zoom · `0` reset zoom · `r` retry if it failed. When the page doesn't fit, the arrows (`hjkl`) scroll it first and turn the page at the edge |
 
 ### Environment variables
 
@@ -320,11 +322,10 @@ More technical details in [`NOTES.md`](NOTES.md) (in Spanish).
 
 - **Cloudflare.** Sources behind Cloudflare's challenge don't work: on Android they're solved with a
   WebView, and there's none here. In testing, ~12 of 165 Spanish sources failed because of this.
-- **Incomplete Android shims.** Some extensions use classes that aren't there yet
-  (`android.webkit.CookieManager`, `android.util.LruCache`, `android.graphics.ColorMatrix`,
-  `Uri.Builder`, `Dispatchers.Main`…) and fail to load or to search.
+- **Incomplete Android shims.** Some extensions use classes that aren't there yet and fail to load or
+  search. The Extensions screen shows the error for those that don't load.
 - **No extension settings screen.** Each source's preferences stay at their defaults.
-- **Downloads can't be read from Han Thỏ** yet: open them with any CBZ reader. No new-chapter notifications either (yet).
+- **Downloads can't be read from Han Thỏ** yet: open them with any CBZ reader.
 - **MCP side pane**: needs a terminal that can split (Windows Terminal, tmux, WezTerm, zellij or
   kitty); otherwise the reader opens in a new window.
 - **macOS** is untested; it should work, but there's no CI for it.

@@ -63,6 +63,10 @@ que ejecuta las extensiones de Mihon/Keiyoushi.
   ext-host, ni un 404/410 al abrir (suele ser de ese manga, no de la fuente).
 - Timeouts al abrir: 20 s (90 s con `r`). Los detalles siguen en segundo plano y se cachean si acaban llegando.
 
+## Capítulos nuevos (`reader/src/news.rs`, `~/.hantho/new_chapters.json`)
+- Solo se comprueba a petición (`u` en la biblioteca, `hantho updates`) y solo lo que está en Leyendo o Releyendo, de dos en dos.
+- Se guardan los capítulos pendientes, no un contador: al leer, el número baja sin volver a consultar la fuente.
+
 ## Render
 - ratatui-image escala con `FilterType::Nearest` y codifica Sixel con Floyd-Steinberg al 0,875, sin opción
   de cambiarlo: en manga produce moiré en las tramas y ruido. Por eso `reader/src/render.rs` hace su propio Sixel:

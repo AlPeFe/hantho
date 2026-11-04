@@ -32,6 +32,7 @@ Usa `HANTHO_HOME=/tmp/hantho-dev` para no tocar tus datos reales mientras prueba
 - Tiene que pasar el CI (Linux y Windows): `cargo build`, `cargo test` y el build de `ext-host`.
 - Ejecuta `cargo fmt` y `cargo clippy` antes de enviarlo.
 - Para cambios en la TUI, añade una captura al PR.
+- Para publicar binarios: sube una etiqueta `vX.Y.Z` (ver `.github/workflows/release.yml`).
 - Comentarios y mensajes de commit en español, como el resto del código.
 
 Al contribuir, aceptas que tu aporte se publique bajo la [licencia Apache-2.0](LICENSE) del proyecto.

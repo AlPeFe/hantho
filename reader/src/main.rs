@@ -14,6 +14,7 @@ mod launch;
 mod library;
 mod mcp;
 mod model;
+mod news;
 mod paths;
 mod prefs;
 mod reads;
@@ -36,7 +37,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    #[command(about = tr!("Busca en todas las fuentes instaladas (sin TUI)", "Search every installed source (no TUI)"))]
+    #[command(about = tr!("Busca en tus fuentes (sin TUI); con más de 20, en las 20 más fiables", "Search your sources (no TUI); with more than 20, the 20 most reliable"))]
     Search {
         query: String,
         #[arg(help = tr!("Solo fuentes de este idioma (p. ej. es)", "Only sources in this language (e.g. en)"))]
@@ -46,6 +47,8 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    #[command(about = tr!("Comprueba si hay capítulos nuevos en los mangas que estás leyendo", "Check for new chapters in the manga you're reading"))]
+    Updates,
     #[command(about = tr!("Descarga capítulos a una carpeta local o remota", "Download chapters to a local or remote folder"))]
     Download {
         #[arg(help = tr!("Título de un favorito (o usa --source y --url)", "Title of a favorite (or use --source and --url)"))]
@@ -191,6 +194,7 @@ async fn main() -> Result<()> {
     match cli.cmd {
         None => tui::run(None).await,
         Some(Cmd::Search { query, lang, all }) => cli_search(query, lang, all).await,
+        Some(Cmd::Updates) => cli_updates().await,
         Some(Cmd::Download { query, source, url, title, chapter, from, until, unread, all, dest, format, force }) => {
             let lib = library::Library::load();
             let target = launch::resolve(&lib, query.as_deref(), source.as_deref(), url.as_deref(), title.as_deref(), tui::ChapterTarget::None)?;
@@ -297,6 +301,24 @@ async fn anilist_cmd(cmd: AnilistCmd) -> Result<()> {
         AnilistCmd::Logout => {
             anilist::Credentials::delete();
             println!("{}", tr!("sesión cerrada", "logged out"));
+        }
+    }
+    Ok(())
+}
+
+async fn cli_updates() -> Result<()> {
+    let host = Host::spawn().await?;
+    let (sources, _) = host.load_all(&ext::list()).await;
+    let loaded = sources.into_iter().map(|s| s.info.id).collect();
+    let mut rx = news::check(host, library::Library::load().favorites, loaded);
+    while let Some(event) = rx.recv().await {
+        match event {
+            news::Event::Progress { .. } => {}
+            news::Event::Found { title, new } => println!("{}", trf!("{title}: {new} por leer", "{title}: {new} to read")),
+            news::Event::Failed { title, error } => eprintln!("✗ {title}: {error}"),
+            news::Event::Done { checked, failed, skipped } => {
+                eprintln!("{}", trf!("{checked} comprobados · {failed} fallidos · {skipped} omitidos", "{checked} checked · {failed} failed · {skipped} skipped"));
+            }
         }
     }
     Ok(())
