@@ -101,8 +101,7 @@ pub fn repos() -> Vec<String> {
 }
 
 fn save_repos(repos: &[String]) -> Result<()> {
-    std::fs::create_dir_all(crate::paths::home())?;
-    std::fs::write(crate::paths::repos_file(), serde_json::to_vec_pretty(repos)?)?;
+    crate::paths::write_atomic(&crate::paths::repos_file(), &serde_json::to_vec_pretty(repos)?)?;
     Ok(())
 }
 
@@ -148,8 +147,7 @@ async fn fetch(url: &str) -> Result<Vec<Extension>> {
             "{url} doesn't publish extensions as .jar (Han Thỏ can't load .apk)"
         ));
     }
-    std::fs::create_dir_all(crate::paths::repos_dir())?;
-    std::fs::write(cache_path(url), &bytes)?;
+    crate::paths::write_atomic(&cache_path(url), &bytes)?;
     Ok(exts)
 }
 

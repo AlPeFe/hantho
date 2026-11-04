@@ -3,6 +3,7 @@
 
 use crate::cache;
 use crate::ext::Installed;
+use crate::health;
 use crate::model::{Chapter, Manga, MangaDetails, MangasPage, Page, SourceInfo};
 use crate::paths;
 use anyhow::{anyhow, bail, Context, Result};
@@ -11,15 +12,22 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::oneshot;
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 
-const DETAILS_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const DETAILS_TTL: Duration = Duration::from_secs(30 * 60);
+/// Cuánto se espera a una fuente al abrir un manga o capítulo.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Al recargar a propósito (`r`) se da más margen: puede ser un manga enorme en una fuente lenta.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(90);
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(60);
+const TIMEOUT_ERROR: &str = "timed out";
 
 pub struct Host {
     stdin: tokio::sync::Mutex<ChildStdin>,
@@ -128,15 +136,43 @@ impl Host {
 
     /// Detalles y capítulos. Cacheados 30 min para no repetir pedidos al volver a un manga;
     /// `refresh` fuerza ir a la fuente (para ver capítulos nuevos).
-    pub async fn details(&self, source: &str, manga: &Manga, refresh: bool) -> Result<MangaDetails> {
+    ///
+    /// No espera más de `REQUEST_TIMEOUT` (`REFRESH_TIMEOUT` con `refresh`). La petición sigue en
+    /// segundo plano y se cachea si acaba llegando: los mangas con muchos capítulos en fuentes
+    /// lentas se abren al reintentar, y una respuesta tardía demuestra que la fuente funciona.
+    pub async fn details(self: &Arc<Self>, source: &str, manga: &Manga, refresh: bool) -> Result<MangaDetails> {
         let key = format!("{source}|{}", manga.url);
         let cached = if refresh { None } else { cache::get::<MangaDetails>("details", &key, DETAILS_TTL) };
         let mut details = match cached {
             Some(hit) => hit,
             None => {
-                let fresh: MangaDetails = self.call("manga", json!({ "source": source, "manga": manga })).await?;
-                cache::put("details", &key, &fresh);
-                fresh
+                let abandoned = Arc::new(AtomicBool::new(false));
+                let started = Instant::now();
+                let request = {
+                    let (host, source, manga, abandoned) = (self.clone(), source.to_string(), manga.clone(), abandoned.clone());
+                    tokio::spawn(async move {
+                        let res: Result<MangaDetails> = host.call("manga", json!({ "source": source, "manga": manga })).await;
+                        match &res {
+                            Ok(fresh) => {
+                                cache::put("details", &key, fresh);
+                                health::record_read_ok(&source, started.elapsed().as_millis() as u64);
+                            }
+                            // Si ya se contó como timeout, no contarlo dos veces
+                            Err(e) if !abandoned.load(Ordering::Relaxed) => health::record_read_error(&source, &e.to_string()),
+                            Err(_) => {}
+                        }
+                        res
+                    })
+                };
+                let limit = if refresh { REFRESH_TIMEOUT } else { REQUEST_TIMEOUT };
+                match tokio::time::timeout(limit, request).await {
+                    Ok(joined) => joined??,
+                    Err(_) => {
+                        abandoned.store(true, Ordering::Relaxed);
+                        health::record_read_error(source, TIMEOUT_ERROR);
+                        bail!(TIMEOUT_ERROR);
+                    }
+                }
             }
         };
         // Fuentes que no informan el número: deducirlo del nombre ("Capítulo 104")
@@ -149,12 +185,21 @@ impl Host {
     }
 
     pub async fn pages(&self, source: &str, chapter: &Chapter) -> Result<Vec<Page>> {
-        self.call("pages", json!({ "source": source, "chapter": chapter })).await
+        let started = Instant::now();
+        let request = self.call("pages", json!({ "source": source, "chapter": chapter }));
+        let res = tokio::time::timeout(REQUEST_TIMEOUT, request).await.unwrap_or_else(|_| Err(anyhow!(TIMEOUT_ERROR)));
+        match &res {
+            Ok(_) => health::record_read_ok(source, started.elapsed().as_millis() as u64),
+            Err(e) => health::record_read_error(source, &e.to_string()),
+        }
+        res
     }
 
     /// Descarga la imagen de una página (a través de la extensión) al archivo `out`.
+    /// Un fallo aquí suele ser de esa página, así que no cuenta para la salud de la fuente.
     pub async fn image(&self, source: &str, page: &Page, out: &Path) -> Result<()> {
-        let _: Value = self.call("image", json!({ "source": source, "page": page, "out": out })).await?;
+        let request = self.call::<Value>("image", json!({ "source": source, "page": page, "out": out }));
+        tokio::time::timeout(IMAGE_TIMEOUT, request).await.map_err(|_| anyhow!(TIMEOUT_ERROR))??;
         Ok(())
     }
 }

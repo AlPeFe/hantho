@@ -7,13 +7,16 @@ use crate::anilist::{self, Credentials, Media, SyncResult};
 use crate::anilist_auth;
 use crate::backup::{self, Backup};
 use crate::catalog;
+use crate::download::{self, Manifest};
 use crate::reads::{self, ReadLog};
 use crate::ext::Installed;
+use crate::health::{self, Health, Record};
 use crate::home::{Home, MenuItem};
 use crate::host::{Host, LoadedSource};
 use crate::library::{AniListLink, LastRead, Library, Status};
 use crate::theme::{self, ERROR, FAINT, LAVENDER, MINT, MUTED, ON_PINK, PEACH, PINK, PINK_DIM, TEXT};
 use crate::model::{Chapter, Manga, MangaDetails, Page};
+use crate::news::{self, News};
 use crate::paths;
 use crate::prefs::{self, Prefs};
 use crate::render::{self, Encoded, Fit, View};
@@ -30,7 +33,7 @@ use ratatui::{DefaultTerminal, Frame};
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{FontSize, StatefulImage};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,7 +50,8 @@ enum Msg {
     /// Paso de animación (~20 por segundo).
     Tick,
     Resize,
-    HostReady(Result<(Arc<Host>, Vec<LoadedSource>, usize)>),
+    /// El host, sus fuentes y las extensiones que no han cargado (nombre, error).
+    HostReady(Result<(Arc<Host>, Vec<LoadedSource>, Vec<(String, String)>)>),
     Search(u64, SearchEvent),
     Details(u64, Result<MangaDetails>),
     Pages(u64, Result<Vec<Page>>),
@@ -71,6 +75,8 @@ enum Msg {
     /// Extensiones actualizadas: las instaladas, sus fuentes recargadas, los errores y los ids de
     /// fuente de la versión anterior (para quitarlas).
     Upgraded(Vec<Installed>, Vec<LoadedSource>, Vec<String>, Vec<String>),
+    Download(download::Event),
+    News(news::Event),
 }
 
 /// Una página descargada. En modo Sixel se codifica con nuestro render (`render.rs`) para el
@@ -165,6 +171,8 @@ fn make_picker() -> Picker {
 enum ChapterInputKind {
     Filter,
     Goto,
+    /// Carpeta donde descargar los capítulos visibles que falten.
+    Download,
 }
 
 struct ChapterInput {
@@ -185,6 +193,8 @@ enum Screen {
     Manga,
     Reader,
     AnilistPick,
+    /// Fuentes que han fallado o se han omitido en la última búsqueda.
+    SourceIssues,
 }
 
 /// El mismo manga encontrado en varias fuentes.
@@ -192,6 +202,14 @@ struct Group {
     key: String,
     title: String,
     entries: Vec<(LoadedSource, Manga)>,
+}
+
+/// Una fuente con problemas en la última búsqueda.
+struct SourceIssue {
+    source: LoadedSource,
+    /// Omitida sin consultarla (si no, ha fallado ahora mismo).
+    skipped: bool,
+    detail: String,
 }
 
 #[derive(Clone, Copy)]
@@ -283,13 +301,19 @@ struct App {
     groups: Vec<Group>,
     groups_state: ListState,
     pending: usize,
-    failures: Vec<(String, String)>,
+    issues: Vec<SourceIssue>,
+    issues_state: ListState,
+    health: Health,
+    /// Fuentes que quedan por consultar en esta búsqueda (`m` pide la siguiente tanda).
+    search_rest: Vec<LoadedSource>,
 
     group: Option<usize>,
     sources_state: ListState,
 
     current: Option<(LoadedSource, Manga)>,
     details: Option<MangaDetails>,
+    /// Por qué no se ha podido abrir el manga actual.
+    details_error: Option<String>,
     chapters_state: ListState,
     /// A dónde vuelve "esc" desde la pantalla del manga.
     manga_back: Screen,
@@ -321,6 +345,18 @@ struct App {
     chapters_reversed: bool,
     /// Entrada de texto en la lista de capítulos: filtrar o ir a un número.
     chapter_input: Option<ChapterInput>,
+
+    downloads: Manifest,
+    download_queue: VecDeque<download::Job>,
+    /// Hay una descarga en marcha: para cancelarla.
+    download_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    download_progress: Option<String>,
+
+    /// Capítulos por leer de los favoritos (`u` en la biblioteca).
+    news: News,
+    news_busy: bool,
+    /// Extensiones que no han cargado: (nombre, error).
+    load_errors: Vec<(String, String)>,
 
     backup_files: Vec<std::path::PathBuf>,
     backup_state: ListState,
@@ -414,11 +450,15 @@ impl App {
             groups: Vec::new(),
             groups_state: ListState::default(),
             pending: 0,
-            failures: Vec::new(),
+            issues: Vec::new(),
+            issues_state: ListState::default(),
+            health: Health::load(),
+            search_rest: Vec::new(),
             group: None,
             sources_state: ListState::default(),
             current: None,
             details: None,
+            details_error: None,
             chapters_state: ListState::default(),
             manga_back: Screen::Search,
             reader: None,
@@ -438,6 +478,13 @@ impl App {
             chapter_filter: String::new(),
             chapters_reversed: false,
             chapter_input: None,
+            downloads: Manifest::load(),
+            download_queue: VecDeque::new(),
+            download_cancel: None,
+            download_progress: None,
+            news: News::load(),
+            news_busy: false,
+            load_errors: Vec::new(),
             backup_files: Vec::new(),
             backup_state: ListState::default(),
             backup_busy: false,
@@ -456,6 +503,7 @@ impl App {
 
     async fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         spawn_input(self.tx.clone());
+        tokio::task::spawn_blocking(crate::cache::sweep);
         let tick_tx = self.tx.clone();
         tokio::spawn(async move {
             let mut every = tokio::time::interval(Duration::from_millis(50));
@@ -468,7 +516,7 @@ impl App {
             let res = async {
                 let host = Host::spawn().await?;
                 let (sources, errors) = host.load_all(&crate::ext::list()).await;
-                Ok((host, sources, errors.len()))
+                Ok((host, sources, errors))
             }
             .await;
             let _ = tx.send(Msg::HostReady(res));
@@ -500,7 +548,9 @@ impl App {
     // ───────────────────────────── eventos ─────────────────────────────
 
     fn update(&mut self, msg: Msg) {
-        if !matches!(msg, Msg::Tick) {
+        // En el lector, redibujar por el progreso de una descarga haría parpadear la página
+        let in_background = matches!(msg, Msg::Download(_)) && self.screen == Screen::Reader;
+        if !matches!(msg, Msg::Tick) && !in_background {
             self.dirty = true;
         }
         match msg {
@@ -523,8 +573,10 @@ impl App {
             Msg::Key(key) => self.on_key(key),
             Msg::Resize => self.clear = true,
             Msg::HostReady(Ok((host, sources, errors))) => {
+                let failed = errors.len();
                 self.status = trf!("{} fuentes listas", "{} sources ready", sources.len())
-                    + &if errors > 0 { trf!(" ({errors} extensiones no han cargado)", " ({errors} extensions failed to load)") } else { String::new() };
+                    + &if failed > 0 { trf!(" ({failed} extensiones no han cargado: míralo en Extensiones)", " ({failed} extensions failed to load: see Extensions)") } else { String::new() };
+                self.load_errors = errors;
                 if sources.is_empty() {
                     self.status = tr!("no hay extensiones: añádelas desde «Añadir extensiones» en el menú", "no extensions yet: add them from “Add extensions” in the menu").into();
                 }
@@ -555,10 +607,15 @@ impl App {
             }
             Msg::Details(generation, res) if generation == self.generation => match res {
                 Ok(d) => {
+                    self.health = Health::load();
                     // Si es un favorito, posicionarse en el último capítulo leído
                     let last = self.current_favorite().and_then(|f| f.last_read.clone());
                     let index = last.and_then(|l| d.chapters.iter().position(|c| c.url == l.chapter_url));
-                    self.status = trf!("{} capítulos", "{} chapters", d.chapters.len());
+                    self.status = if d.chapters.is_empty() {
+                        tr!("esta fuente no tiene capítulos: s para buscar en otras", "this source has no chapters: s to look in others").into()
+                    } else {
+                        trf!("{} capítulos", "{} chapters", d.chapters.len())
+                    };
                     self.details = Some(d);
                     self.chapter_filter.clear();
                     self.chapter_input = None;
@@ -573,7 +630,10 @@ impl App {
                 }
                 Err(e) => {
                     self.pending_chapter = None;
-                    self.status = format!("error: {}", search::short_error(&e.to_string()))
+                    self.health = Health::load();
+                    let error = search::short_error(&e.to_string());
+                    self.status = format!("error: {error}");
+                    self.details_error = Some(error);
                 }
             },
             Msg::Pages(generation, res) if generation == self.generation => {
@@ -671,6 +731,7 @@ impl App {
                 match res {
                     Ok((ext, sources)) => {
                         self.status = trf!("✓ {} instalada · {} fuentes nuevas", "✓ {} installed · {} new sources", ext.name, sources.len());
+                        self.load_errors.retain(|(name, _)| *name != ext.name);
                         self.sources.retain(|s| !sources.iter().any(|n| n.info.id == s.info.id));
                         self.sources.extend(sources);
                         self.installed = crate::ext::list();
@@ -693,6 +754,7 @@ impl App {
             Msg::Updates(Err(_)) => {}
             Msg::Upgraded(installed, sources, errors, old_ids) => {
                 self.upgrading = false;
+                self.load_errors.retain(|(name, _)| !installed.iter().any(|i| i.name == *name));
                 self.sources.retain(|s| !old_ids.contains(&s.info.id));
                 self.sources.extend(sources);
                 self.installed = crate::ext::list();
@@ -702,6 +764,8 @@ impl App {
                     self.status += &trf!(" · {} con errores ({first})", " · {} with errors ({first})", errors.len());
                 }
             }
+            Msg::Download(event) => self.on_download_event(event),
+            Msg::News(event) => self.on_news_event(event),
             Msg::AutoLink(source_id, url, title, res) => self.on_auto_link(&source_id, &url, &title, res),
             Msg::AnilistLogin(res) => {
                 self.anilist_login = false;
@@ -743,6 +807,7 @@ impl App {
             Screen::Manga => self.key_manga(key),
             Screen::Reader => self.key_reader(key),
             Screen::AnilistPick => self.key_anilist_pick(key),
+            Screen::SourceIssues => self.key_source_issues(key),
         }
     }
 
@@ -758,7 +823,7 @@ impl App {
             Screen::AddExtensions => {
                 self.add.loading || self.add.editing || self.add.repo_input.is_some() || !self.add.busy.is_empty()
             }
-            Screen::Manga => self.details.is_none() || self.chapter_input.is_some(),
+            Screen::Manga => (self.details.is_none() && self.details_error.is_none()) || self.chapter_input.is_some(),
             Screen::Reader => self.reader.as_ref().is_some_and(|r| {
                 r.error.is_none() && r.images.get(&r.page).is_none_or(|p| self.sixel && p.encoded.is_none())
             }),
@@ -1036,6 +1101,7 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => select_prev(&mut self.library_state),
             KeyCode::Down | KeyCode::Char('j') => select_next(&mut self.library_state, len),
+            KeyCode::Char('u') => self.check_news(),
             KeyCode::Char('d') | KeyCode::Delete => {
                 let Some(i) = self.library_state.selected().filter(|&i| i < len) else { return };
                 let fav = self.library.favorites.remove(i);
@@ -1114,6 +1180,8 @@ impl App {
             KeyCode::Char('/') | KeyCode::Char('s') => self.editing = true,
             KeyCode::Char('b') | KeyCode::Tab => self.screen = Screen::Library,
             KeyCode::Char('l') => self.cycle_search_langs(),
+            KeyCode::Char('f') => self.open_source_issues(),
+            KeyCode::Char('m') => self.search_more(),
             KeyCode::Up | KeyCode::Char('k') => select_prev(&mut self.groups_state),
             KeyCode::Down | KeyCode::Char('j') => select_next(&mut self.groups_state, self.groups.len()),
             KeyCode::Enter => {
@@ -1124,12 +1192,275 @@ impl App {
                     self.manga_back = Screen::Search;
                     self.open_manga(src, manga, false);
                 } else {
-                    self.group = Some(i);
-                    self.sources_state.select(Some(0));
-                    self.screen = Screen::Sources;
+                    self.show_group(i, None);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Enseña las fuentes de un grupo, primero las que mejor funcionan. La fuente `last` (la que
+    /// acaba de fallar) va al final.
+    fn show_group(&mut self, index: usize, last: Option<&str>) {
+        let health = &self.health;
+        self.groups[index].entries.sort_by_key(|(s, _)| {
+            let record = health.get(&s.info.id);
+            let problem = record.is_some_and(|r| r.disabled || r.has_problem());
+            (last == Some(s.info.id.as_str()), problem, record.and_then(|r| r.latency_ms).unwrap_or(u64::MAX))
+        });
+        self.group = Some(index);
+        self.sources_state.select(Some(0));
+        self.screen = Screen::Sources;
+    }
+
+    fn open_source_issues(&mut self) {
+        if self.issues.is_empty() {
+            self.status = tr!("ninguna fuente ha dado problemas", "no sources had problems").into();
+            return;
+        }
+        self.health = Health::load();
+        self.issues_state.select(Some(0));
+        self.screen = Screen::SourceIssues;
+    }
+
+    fn key_source_issues(&mut self, key: KeyEvent) {
+        let len = self.issues.len();
+        let selected = self.issues_state.selected().filter(|&i| i < len);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.screen = Screen::Search,
+            KeyCode::Up | KeyCode::Char('k') => select_prev(&mut self.issues_state),
+            KeyCode::Down | KeyCode::Char('j') => select_next(&mut self.issues_state, len),
+            KeyCode::Char('U') => self.upgrade_all(),
+            KeyCode::Char('d') => {
+                let Some(i) = selected else { return };
+                let id = self.issues[i].source.info.id.clone();
+                let disabled = !self.health.get(&id).is_some_and(|r| r.disabled);
+                Health::update(|h| {
+                    h.set_disabled(&id, disabled);
+                    if !disabled {
+                        h.forgive(&id);
+                    }
+                });
+                self.health = Health::load();
+                let name = &self.issues[i].source.info.name;
+                self.status = if disabled {
+                    trf!("{name} desactivada: no se buscará en ella", "{name} disabled: it won't be searched")
+                } else {
+                    trf!("{name} activada", "{name} enabled")
+                };
+            }
+            // Las respuestas de una búsqueda en curso se mezclarían con las del reintento
+            KeyCode::Char('r') | KeyCode::Char('R') if self.pending > 0 => {
+                self.status = tr!("espera a que termine la búsqueda", "wait for the search to finish").into();
+            }
+            KeyCode::Char('r') => {
+                let Some(i) = selected else { return };
+                let issue = self.issues.remove(i);
+                self.retry_sources(vec![issue.source]);
+                if self.issues.is_empty() {
+                    self.screen = Screen::Search;
+                } else {
+                    self.issues_state.select(Some(i.min(self.issues.len() - 1)));
+                }
+            }
+            KeyCode::Char('R') => {
+                let sources = std::mem::take(&mut self.issues).into_iter().map(|issue| issue.source).collect();
+                self.retry_sources(sources);
+                self.screen = Screen::Search;
+            }
+            _ => {}
+        }
+    }
+
+    /// Olvida los fallos de estas fuentes y las vuelve a consultar, sin perder los resultados que ya hay.
+    fn retry_sources(&mut self, sources: Vec<LoadedSource>) {
+        Health::update(|h| sources.iter().for_each(|s| h.forgive(&s.info.id)));
+        self.health = Health::load();
+        // Las desactivadas siguen fuera hasta que se activen
+        let (sources, disabled): (Vec<_>, Vec<_>) =
+            sources.into_iter().partition(|s| !self.health.get(&s.info.id).is_some_and(|r| r.disabled));
+        self.issues.extend(disabled.into_iter().map(|source| SourceIssue { source, skipped: true, detail: String::new() }));
+        if !sources.is_empty() {
+            self.spawn_search(sources);
+        }
+    }
+
+    /// Busca el manga actual en otras fuentes (cuando esta falla o no tiene capítulos).
+    fn find_alternatives(&mut self) {
+        let Some((source, manga)) = self.current.clone() else { return };
+        let title = self.details.as_ref().map(|d| d.manga.title.clone()).filter(|t| !t.is_empty()).unwrap_or(manga.title);
+        let key = search::normalize(&title);
+        if key.is_empty() {
+            self.status = tr!("este manga no tiene título con el que buscar", "this manga has no title to search for").into();
+            return;
+        }
+        let group = self.groups.iter().position(|g| g.key == key && g.entries.iter().any(|(s, _)| s.info.id != source.info.id));
+        let same_search = search::normalize(&self.query) == key;
+        if group.is_none() && same_search && self.pending == 0 && self.search_rest.is_empty() {
+            self.status = tr!("ninguna otra fuente lo tiene", "no other source has it").into();
+            return;
+        }
+        self.generation += 1;
+        match group {
+            Some(i) => self.show_group(i, Some(&source.info.id)),
+            None => {
+                // Desde la biblioteca, o con otra búsqueda en pantalla: buscar este título
+                self.manga_back = Screen::Search;
+                self.screen = Screen::Search;
+                self.editing = false;
+                if !same_search {
+                    self.group = None;
+                    self.query = title.clone();
+                    self.input = title;
+                    self.start_search();
+                } else if self.pending == 0 {
+                    self.search_more();
+                }
+            }
+        }
+    }
+
+    /// Busca capítulos nuevos en lo que se está leyendo.
+    fn check_news(&mut self) {
+        if self.news_busy {
+            return;
+        }
+        let Some(host) = self.host.clone() else {
+            self.status = tr!("esperando a que carguen las extensiones…", "waiting for extensions to load…").into();
+            return;
+        };
+        self.news_busy = true;
+        self.status = tr!("comprobando capítulos nuevos…", "checking for new chapters…").into();
+        let loaded = self.sources.iter().map(|s| s.info.id.clone()).collect();
+        let mut rx = news::check(host, self.library.favorites.clone(), loaded);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if tx.send(Msg::News(event)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn on_news_event(&mut self, event: news::Event) {
+        match event {
+            news::Event::Found { .. } | news::Event::Failed { .. } => {}
+            news::Event::Progress { done, total } => {
+                self.news = News::load();
+                self.status = trf!("comprobando capítulos nuevos… {done}/{total}", "checking for new chapters… {done}/{total}");
+            }
+            news::Event::Done { checked, failed, skipped } => {
+                self.news_busy = false;
+                self.news = News::load();
+                let with_news = self.library.favorites.iter().filter(|f| self.news.count(f, &self.reads) > 0).count();
+                self.status = trf!("{with_news} mangas con capítulos por leer · {checked} comprobados", "{with_news} manga with chapters to read · {checked} checked");
+                if failed + skipped > 0 {
+                    self.status = trf!("{} · {failed} fallidos · {skipped} omitidos", "{} · {failed} failed · {skipped} skipped", self.status);
+                }
+            }
+        }
+    }
+
+    /// Capítulos visibles (según el filtro) que aún no están descargados.
+    fn missing_chapters(&self) -> Vec<usize> {
+        let key = self.current_key().unwrap_or_default();
+        let Some(details) = &self.details else { return Vec::new() };
+        self.chapter_view.iter().copied().filter(|&i| !self.downloads.contains(&key, &details.chapters[i].url)).collect()
+    }
+
+    /// Pone capítulos en la cola de descargas y recuerda el destino.
+    fn download_chapters(&mut self, indices: &[usize], dest_text: &str) {
+        let (Some((source, manga)), Some(details)) = (&self.current, &self.details) else { return };
+        if self.host.is_none() {
+            self.status = tr!("esperando a que carguen las extensiones…", "waiting for extensions to load…").into();
+            return;
+        }
+        if indices.is_empty() {
+            self.status = tr!("no hay nada que descargar", "nothing to download").into();
+            return;
+        }
+        let dest = match download::Dest::parse(dest_text) {
+            Ok(dest) => dest,
+            Err(e) => {
+                self.status = format!("✕ {e}");
+                return;
+            }
+        };
+        let title = if details.manga.title.is_empty() { &manga.title } else { &details.manga.title };
+        let job = download::Job::new(&source.info.id, &manga.url, title, &details.chapters, indices, dest, self.prefs.download_format);
+        self.status = trf!("descarga: {} capítulos a {dest_text}", "download: {} chapters to {dest_text}", indices.len());
+        self.prefs.download_dest = Some(dest_text.trim().to_string());
+        self.prefs.save();
+        self.download_queue.push_back(job);
+        self.next_download();
+    }
+
+    fn next_download(&mut self) {
+        if self.download_cancel.is_some() {
+            return;
+        }
+        let Some(host) = self.host.clone() else { return };
+        let Some(job) = self.download_queue.pop_front() else { return };
+        self.download_cancel = Some(job.cancel.clone());
+        let mut rx = download::start(host, job);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if tx.send(Msg::Download(event)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn cancel_downloads(&mut self) {
+        let Some(cancel) = &self.download_cancel else {
+            self.status = tr!("no hay ninguna descarga en marcha", "no download in progress").into();
+            return;
+        };
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.download_queue.clear();
+        self.status = tr!("cancelando la descarga…", "cancelling the download…").into();
+    }
+
+    fn on_download_event(&mut self, event: download::Event) {
+        match event {
+            download::Event::Progress { chapter, chapters, name, page, pages } => {
+                self.download_progress = Some(if pages == 0 {
+                    format!("⬇ {chapter}/{chapters} {name}")
+                } else {
+                    format!("⬇ {chapter}/{chapters} {name} · {page}/{pages}")
+                });
+            }
+            download::Event::Saved { .. } => self.downloads = Manifest::load(),
+            download::Event::Failed { .. } => {}
+            download::Event::Finished(summary) => {
+                self.download_cancel = None;
+                self.download_progress = None;
+                self.downloads = Manifest::load();
+                let mut text = if summary.cancelled {
+                    trf!("descarga cancelada · {} guardados", "download cancelled · {} saved", summary.saved)
+                } else {
+                    trf!("✓ {} capítulos guardados", "✓ {} chapters saved", summary.saved)
+                };
+                if summary.skipped > 0 {
+                    text = trf!("{text} · {} ya estaban", "{text} · {} already there", summary.skipped);
+                }
+                if summary.missing_pages > 0 {
+                    text = trf!("{text} · la web no tenía {} páginas", "{text} · the site was missing {} pages", summary.missing_pages);
+                }
+                if summary.failed > 0 {
+                    text = trf!("{text} · {} han fallado", "{text} · {} failed", summary.failed);
+                }
+                if let Some(reason) = summary.stopped.or(summary.last_error) {
+                    text = format!("{text} ({reason})");
+                }
+                if self.screen != Screen::Reader {
+                    self.status = text;
+                }
+                self.next_download();
+            }
         }
     }
 
@@ -1193,6 +1524,17 @@ impl App {
             }
             KeyCode::Char('a') => self.anilist_sync(false),
             KeyCode::Char('A') => self.anilist_sync(true),
+            KeyCode::Char('s') => self.find_alternatives(),
+            KeyCode::Char('d') => {
+                if let Some(i) = self.selected_chapter() {
+                    let dest = self.prefs.download_dest();
+                    self.download_chapters(&[i], &dest);
+                }
+            }
+            KeyCode::Char('D') if self.details.is_some() => {
+                self.chapter_input = Some(ChapterInput { kind: ChapterInputKind::Download, text: self.prefs.download_dest() })
+            }
+            KeyCode::Char('X') => self.cancel_downloads(),
             KeyCode::Char('r') => {
                 if let Some((src, manga)) = self.current.clone() {
                     self.open_manga(src, manga, true);
@@ -1231,6 +1573,10 @@ impl App {
     fn key_chapter_input(&mut self, key: KeyEvent) {
         let Some(input) = self.chapter_input.as_mut() else { return };
         match key.code {
+            KeyCode::Tab if input.kind == ChapterInputKind::Download => {
+                self.prefs.download_format = self.prefs.download_format.toggled();
+                return;
+            }
             KeyCode::Char(c) => input.text.push(c),
             KeyCode::Backspace => {
                 input.text.pop();
@@ -1245,8 +1591,13 @@ impl App {
             }
             KeyCode::Enter => {
                 let input = self.chapter_input.take().unwrap();
-                if input.kind == ChapterInputKind::Goto {
-                    self.goto_chapter_number(&input.text);
+                match input.kind {
+                    ChapterInputKind::Goto => self.goto_chapter_number(&input.text),
+                    ChapterInputKind::Download => {
+                        let pending = self.missing_chapters();
+                        self.download_chapters(&pending, &input.text);
+                    }
+                    ChapterInputKind::Filter => {}
                 }
                 return;
             }
@@ -1312,6 +1663,7 @@ impl App {
             }
             // Con zoom o ajuste al ancho, las flechas primero recorren la página y al llegar al
             // borde pasan de página (como un webtoon)
+            KeyCode::Char('r') if r.error.is_some() => self.retry_reader(),
             KeyCode::Down | KeyCode::Char('j') => self.scroll_or_turn(Axis::Y, 0.35, true),
             KeyCode::Up | KeyCode::Char('k') => self.scroll_or_turn(Axis::Y, 0.35, false),
             KeyCode::Char(' ') | KeyCode::PageDown => self.scroll_or_turn(Axis::Y, 0.9, true),
@@ -1427,16 +1779,47 @@ impl App {
     fn start_search(&mut self) {
         self.groups.clear();
         self.groups_state.select(None);
-        self.failures.clear();
-        let Some(host) = self.host.clone() else {
+        self.issues.clear();
+        self.search_rest.clear();
+        if self.host.is_none() {
             self.status = tr!("esperando a que carguen las extensiones…", "waiting for extensions to load…").into();
             return;
-        };
+        }
         let sources = self.search_sources();
         if sources.is_empty() {
             self.status = trf!("ninguna fuente en {} (cambia con ctrl+L)", "no sources in {} (change it with ctrl+L)", self.prefs.langs_label());
             return;
         }
+        self.health = Health::load();
+        let (sources, skipped) = self.health.partition(sources, crate::library::now());
+        self.issues.extend(skipped.into_iter().map(|source| {
+            let detail = self.health.get(&source.info.id).and_then(|r| r.error.clone()).unwrap_or_default();
+            SourceIssue { source, skipped: true, detail }
+        }));
+        if sources.is_empty() {
+            self.status = tr!("todas las fuentes de este idioma están desactivadas: f para verlas", "all sources in this language are disabled: f to see them").into();
+            return;
+        }
+        let favorites: HashSet<&str> = self.library.favorites.iter().map(|f| f.source_id.as_str()).collect();
+        let (sources, rest) = self.health.first_batch(sources, &favorites);
+        self.search_rest = rest;
+        self.spawn_search(sources);
+    }
+
+    /// Consulta la siguiente tanda de fuentes, sin perder los resultados que ya hay.
+    fn search_more(&mut self) {
+        if self.search_rest.is_empty() {
+            self.status = tr!("ya has buscado en todas las fuentes", "you've already searched every source").into();
+        } else if self.pending > 0 {
+            self.status = tr!("espera a que termine la búsqueda", "wait for the search to finish").into();
+        } else {
+            let next: Vec<_> = self.search_rest.drain(..health::BATCH_SIZE.min(self.search_rest.len())).collect();
+            self.spawn_search(next);
+        }
+    }
+
+    fn spawn_search(&mut self, sources: Vec<LoadedSource>) {
+        let Some(host) = self.host.clone() else { return };
         self.search_gen += 1;
         self.pending = sources.len();
         let generation = self.search_gen;
@@ -1466,9 +1849,12 @@ impl App {
             }
             SearchEvent::Failed { source, error } => {
                 self.pending = self.pending.saturating_sub(1);
-                self.failures.push((source.info.name, error));
+                self.issues.push(SourceIssue { source, skipped: false, detail: error });
             }
-            SearchEvent::Done => self.pending = 0,
+            SearchEvent::Done => {
+                self.pending = 0;
+                self.health = Health::load();
+            }
         }
     }
 
@@ -1476,6 +1862,7 @@ impl App {
     /// y a igualdad, las que están en más fuentes. Mantiene la selección en el mismo grupo.
     fn sort_groups(&mut self) {
         let selected = self.groups_state.selected().map(|i| self.groups[i].key.clone());
+        let open = self.group.and_then(|i| self.groups.get(i)).map(|g| g.key.clone());
         let q = search::normalize(&self.query);
         let rank = |g: &Group| {
             let r = if g.key == q {
@@ -1490,6 +1877,10 @@ impl App {
             (r, std::cmp::Reverse(g.entries.len()))
         };
         self.groups.sort_by_key(rank);
+        // El grupo abierto en la pantalla de fuentes puede haber cambiado de posición
+        if let Some(key) = open {
+            self.group = self.groups.iter().position(|g| g.key == key);
+        }
         let index = selected.and_then(|k| self.groups.iter().position(|g| g.key == k));
         self.groups_state.select(index.or((!self.groups.is_empty()).then_some(0)));
     }
@@ -1499,6 +1890,7 @@ impl App {
         self.generation += 1;
         let generation = self.generation;
         self.details = None;
+        self.details_error = None;
         self.chapters_state.select(None);
         self.status = trf!("cargando {} desde {}…", "loading {} from {}…", manga.title, source.info.name);
         self.current = Some((source.clone(), manga.clone()));
@@ -1946,6 +2338,23 @@ impl App {
         });
     }
 
+    /// Vuelve a pedir lo que ha fallado: la página actual o, si ni siquiera hay lista, el capítulo.
+    fn retry_reader(&mut self) {
+        let Some(r) = self.reader.as_mut() else { return };
+        if r.pages.is_empty() {
+            let (chapter, page) = (r.chapter, r.page);
+            self.open_chapter(chapter);
+            if let Some(r) = self.reader.as_mut() {
+                r.page = page;
+            }
+        } else {
+            r.error = None;
+            let page = r.page;
+            r.requested.remove(&page);
+            self.prefetch();
+        }
+    }
+
     fn page_changed(&mut self) {
         self.clear = true;
         if let Some(r) = self.reader.as_mut() {
@@ -1969,7 +2378,7 @@ impl App {
             }
             let page = r.pages[index].clone();
             let source_id = r.source.info.id.clone();
-            let path = page_cache_path(&r.source, &r.chapters[r.chapter], index);
+            let path = page_cache_path(&r.source.info.id, &r.chapters[r.chapter].url, index);
             let (tx, host, generation) = (self.tx.clone(), host.clone(), self.generation);
             tokio::spawn(async move {
                 let res = async {
@@ -2052,6 +2461,7 @@ impl App {
             Screen::Library => self.draw_library(f),
             Screen::Search => self.draw_search(f),
             Screen::Sources => self.draw_sources(f),
+            Screen::SourceIssues => self.draw_source_issues(f),
             Screen::Manga => self.draw_manga(f),
             Screen::Reader => self.draw_reader(f),
             Screen::AnilistPick => self.draw_anilist_pick(f),
@@ -2150,11 +2560,16 @@ impl App {
                         Some(_) if fav.needs_sync() => Span::raw(" ↻").fg(PEACH),
                         Some(_) => Span::raw(" ✓").fg(MINT),
                     };
-                    ListItem::new(Line::from(vec![
+                    let mut spans = vec![
                         Span::raw(fav.manga.title.clone()).fg(TEXT),
                         Span::raw(trf!("  cap. {}", "  ch. {}", fav.progress)).fg(MUTED),
                         sync,
-                    ]))
+                    ];
+                    let new = self.news.count(fav, &self.reads);
+                    if new > 0 {
+                        spans.push(Span::raw(format!("  +{new}")).fg(PEACH).bold());
+                    }
+                    ListItem::new(Line::from(spans))
                 })
                 .collect();
             f.render_stateful_widget(
@@ -2166,7 +2581,7 @@ impl App {
                 f.render_widget(favorite_card(fav), card_area);
             }
         }
-        theme::status_bar(f, status_area, tr!("BIBLIOTECA", "LIBRARY"), &self.status, &[("enter", tr!("abrir", "open")), ("d", tr!("quitar", "remove")), ("/", tr!("buscar", "search")), ("esc", tr!("menú", "menu"))]);
+        theme::status_bar(f, status_area, tr!("BIBLIOTECA", "LIBRARY"), &self.status, &[("enter", tr!("abrir", "open")), ("u", tr!("capítulos nuevos", "new chapters")), ("d", tr!("quitar", "remove")), ("/", tr!("buscar", "search")), ("esc", tr!("menú", "menu"))]);
     }
 
     fn draw_extensions(&mut self, f: &mut Frame) {
@@ -2180,7 +2595,9 @@ impl App {
                     2 => (tr!("mixto", "mixed"), PEACH),
                     _ => (tr!("apto", "safe"), MINT),
                 };
-                let loaded = self.sources.iter().any(|s| s.info.name == e.name);
+                // Una extensión puede tener varias fuentes con otros nombres: lo que cuenta es si ha fallado
+                let error = self.load_errors.iter().find(|(name, _)| *name == e.name).map(|(_, error)| error);
+                let loaded = self.host.is_some() && error.is_none();
                 let mut spans = vec![
                     Span::raw(if loaded { "● " } else { "○ " }).fg(if loaded { MINT } else { FAINT }),
                     Span::raw(format!("{:<34}", e.name)).fg(TEXT),
@@ -2190,6 +2607,9 @@ impl App {
                 ];
                 if let Some(new) = self.updates.iter().find(|u| u.package_name == e.pkg) {
                     spans.push(Span::raw(format!("  ↑ {}", new.version_name)).fg(PEACH));
+                }
+                if let Some(error) = error {
+                    spans.push(Span::raw(format!("  ✕ {}", search::short_error(error))).fg(ERROR));
                 }
                 ListItem::new(Line::from(spans))
             })
@@ -2527,15 +2947,29 @@ impl App {
         let mut status = self.status.clone();
         if self.pending > 0 {
             status = trf!("{} buscando… faltan {} fuentes", "{} searching… {} sources to go", theme::spinner(self.tick), self.pending);
-        } else if !self.query.is_empty() && !self.failures.is_empty() {
-            status = trf!("{status} · {} fuentes han fallado", "{status} · {} sources failed", self.failures.len());
+        } else if !self.query.is_empty() && !self.issues.is_empty() {
+            let skipped = self.issues.iter().filter(|i| i.skipped).count();
+            let failed = self.issues.len() - skipped;
+            if failed > 0 {
+                status = trf!("{status} · {failed} han fallado", "{status} · {failed} failed");
+            }
+            if skipped > 0 {
+                status = trf!("{status} · {skipped} omitidas", "{status} · {skipped} skipped");
+            }
         }
-        let keys: &[(&str, &str)] = if self.editing {
-            &[("enter", tr!("buscar", "search")), ("^L", tr!("idioma", "language")), ("↓", tr!("resultados", "results")), ("esc", tr!("menú", "menu"))]
+        if self.pending == 0 && !self.search_rest.is_empty() {
+            let rest = self.search_rest.len();
+            status = trf!("{status} · quedan {rest} fuentes: m para buscar en más", "{status} · {rest} sources left: m to search more");
+        }
+        let mut keys = if self.editing {
+            vec![("enter", tr!("buscar", "search")), ("^L", tr!("idioma", "language")), ("↓", tr!("resultados", "results")), ("esc", tr!("menú", "menu"))]
         } else {
-            &[("enter", tr!("abrir", "open")), ("/", tr!("editar", "edit")), ("l", tr!("idioma", "language")), ("b", tr!("biblioteca", "library")), ("esc", tr!("menú", "menu"))]
+            vec![("enter", tr!("abrir", "open")), ("/", tr!("editar", "edit")), ("f", tr!("fallos", "failures")), ("l", tr!("idioma", "language")), ("b", tr!("biblioteca", "library")), ("esc", tr!("menú", "menu"))]
         };
-        theme::status_bar(f, status_area, tr!("BUSCAR", "SEARCH"), &status, keys);
+        if !self.editing && !self.search_rest.is_empty() {
+            keys.insert(1, ("m", tr!("buscar en más", "search more")));
+        }
+        theme::status_bar(f, status_area, tr!("BUSCAR", "SEARCH"), &status, &keys);
     }
 
     fn draw_sources(&mut self, f: &mut Frame) {
@@ -2545,9 +2979,17 @@ impl App {
             .entries
             .iter()
             .map(|(s, m)| {
+                let state = match self.health.get(&s.info.id) {
+                    Some(r) if r.disabled => Span::raw(format!("{:<11}", tr!("desactivada", "disabled"))).fg(FAINT),
+                    Some(r) if r.has_problem() => Span::raw(format!("{:<11}", trf!("⚠ {} fallos", "⚠ {} fails", r.fails.max(r.read_fails)))).fg(PEACH),
+                    Some(Record { latency_ms: Some(ms), .. }) => Span::raw(format!("{:<11}", format!("{:.1} s", *ms as f32 / 1000.0))).fg(MINT),
+                    _ => Span::raw(format!("{:<11}", "")),
+                };
                 ListItem::new(Line::from(vec![
                     Span::raw(format!("{:<28}", s.info.name)).fg(TEXT).bold(),
                     Span::raw(format!(" {:<4} ", s.info.lang)).fg(LAVENDER),
+                    state,
+                    Span::raw(" "),
                     Span::raw(m.title.clone()).fg(MUTED),
                 ]))
             })
@@ -2555,6 +2997,46 @@ impl App {
         let title = trf!("{} · en {} fuentes", "{} · in {} sources", g.title, g.entries.len());
         f.render_stateful_widget(theme::highlight(List::new(items).block(theme::block_focused(&title))), list_area, &mut self.sources_state);
         theme::status_bar(f, status_area, tr!("FUENTE", "SOURCE"), tr!("elige de dónde leerlo", "choose where to read it"), &[("enter", tr!("abrir", "open")), ("esc", tr!("volver", "back"))]);
+    }
+
+    fn draw_source_issues(&mut self, f: &mut Frame) {
+        let [list_area, status_area] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
+        let now = crate::library::now();
+        let items: Vec<ListItem> = self
+            .issues
+            .iter()
+            .map(|issue| {
+                let info = &issue.source.info;
+                let record = self.health.get(&info.id);
+                let state = if record.is_some_and(|r| r.disabled) {
+                    Span::raw(format!("{:<22}", tr!("desactivada", "disabled"))).fg(FAINT)
+                } else if issue.skipped {
+                    let wait = record.and_then(|r| r.skip_until()).map_or(0, |until| until.saturating_sub(now));
+                    Span::raw(format!("{:<22}", trf!("omitida · vuelve en {}", "skipped · back in {}", health::format_wait(wait)))).fg(PEACH)
+                } else {
+                    Span::raw(format!("{:<22}", tr!("ha fallado", "failed"))).fg(ERROR)
+                };
+                let mut spans = vec![
+                    Span::raw(format!("{:<28}", info.name)).fg(TEXT).bold(),
+                    Span::raw(format!(" {:<4} ", info.lang)).fg(LAVENDER),
+                    state,
+                    Span::raw(" "),
+                ];
+                if self.updates.iter().any(|u| u.sources.iter().any(|s| s.id.to_string() == info.id)) {
+                    spans.push(Span::raw(tr!("↑ versión nueva  ", "↑ new version  ")).fg(PEACH));
+                }
+                spans.push(Span::raw(issue.detail.clone()).fg(MUTED));
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let title = trf!("⚠ fuentes con problemas · {}", "⚠ sources with problems · {}", self.issues.len());
+        f.render_stateful_widget(theme::highlight(List::new(items).block(theme::block_focused(&title))), list_area, &mut self.issues_state);
+        let mut keys = vec![("r", tr!("reintentar", "retry")), ("R", tr!("reintentar todas", "retry all")), ("d", tr!("activar/desactivar", "enable/disable"))];
+        if !self.updates.is_empty() {
+            keys.push(("U", tr!("actualizar extensiones", "update extensions")));
+        }
+        keys.push(("esc", tr!("volver", "back")));
+        theme::status_bar(f, status_area, tr!("FALLOS", "FAILURES"), &self.status, &keys);
     }
 
     fn draw_manga(&mut self, f: &mut Frame) {
@@ -2608,6 +3090,17 @@ impl App {
         let last_read = self.current_favorite().and_then(|f| f.last_read.as_ref()).map(|l| l.chapter_url.clone());
         let read_key = self.current_key().unwrap_or_default();
         match &self.details {
+            None if self.details_error.is_some() => f.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!("✕ {}", self.details_error.as_deref().unwrap_or_default())).fg(ERROR),
+                    Line::default(),
+                    Line::from(vec![Span::raw("s").fg(PINK).bold(), Span::raw(tr!(" buscar en otras fuentes", " look in other sources")).fg(MUTED)]),
+                    Line::from(vec![Span::raw("r").fg(PINK).bold(), Span::raw(tr!(" reintentar con más margen", " retry with more time")).fg(MUTED)]),
+                ])
+                .wrap(Wrap { trim: true })
+                .block(theme::block_focused(tr!("capítulos", "chapters"))),
+                list_area,
+            ),
             None => f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::raw(theme::spinner(self.tick)).fg(PINK),
@@ -2631,7 +3124,11 @@ impl App {
                             Span::raw("  ")
                         };
                         // Los leídos se apagan; los pendientes quedan en primer plano
-                        let mut spans = vec![marker, Span::raw(c.name.clone()).fg(if read { FAINT } else { TEXT })];
+                        let mut spans = vec![marker];
+                        if self.downloads.contains(&read_key, &c.url) {
+                            spans.push(Span::raw("⬇ ").fg(MINT));
+                        }
+                        spans.push(Span::raw(c.name.clone()).fg(if read { FAINT } else { TEXT }));
                         if let Some(s) = c.scanlator.as_ref().filter(|s| !s.is_empty()) {
                             spans.push(Span::raw(format!("  {s}")).fg(FAINT));
                         }
@@ -2643,9 +3140,18 @@ impl App {
                 if self.chapters_reversed {
                     title += tr!(" · ↑ viejos primero", " · ↑ oldest first");
                 }
+                if let Some(progress) = &self.download_progress {
+                    title = format!("{title} · {progress}");
+                }
                 match &self.chapter_input {
                     Some(input) => {
-                        let label = if input.kind == ChapterInputKind::Filter { tr!("filtrar", "filter") } else { tr!("ir al capítulo", "go to chapter") };
+                        let label = match input.kind {
+                            ChapterInputKind::Filter => tr!("filtrar", "filter").to_string(),
+                            ChapterInputKind::Goto => tr!("ir al capítulo", "go to chapter").to_string(),
+                            ChapterInputKind::Download => {
+                                trf!("descargar {} capítulos ({}) en", "download {} chapters ({}) to", self.missing_chapters().len(), self.prefs.download_format.label())
+                            }
+                        };
                         let cursor = if self.tick % 16 < 9 { "▏" } else { " " };
                         title = format!("{label}: {}{cursor}", input.text);
                     }
@@ -2667,9 +3173,13 @@ impl App {
             "MANGA",
             &self.status,
             &if self.chapter_input.is_some() {
-                vec![("enter", tr!("aceptar", "ok")), ("esc", tr!("cancelar", "cancel"))]
+                let mut keys = vec![("enter", tr!("aceptar", "ok")), ("esc", tr!("cancelar", "cancel"))];
+                if self.chapter_input.as_ref().is_some_and(|i| i.kind == ChapterInputKind::Download) {
+                    keys.push(("tab", tr!("formato", "format")));
+                }
+                keys
             } else {
-                vec![("enter", tr!("leer", "read")), ("m/M", tr!("leído", "read")), ("/", tr!("filtrar", "filter")), ("#", tr!("ir a", "go to")), ("o", tr!("orden", "order")), ("c", tr!("seguir", "continue")), ("f", "fav"), ("a", "anilist")]
+                vec![("enter", tr!("leer", "read")), ("s", tr!("otras fuentes", "other sources")), ("d/D", tr!("descargar", "download")), ("m/M", tr!("leído", "read")), ("/", tr!("filtrar", "filter")), ("#", tr!("ir a", "go to")), ("o", tr!("orden", "order")), ("c", tr!("seguir", "continue")), ("f", "fav"), ("a", "anilist")]
             },
         );
     }
@@ -2701,6 +3211,7 @@ impl App {
         let view = r.view;
         let page = r.images.get_mut(&r.page);
         let ready = page.as_ref().is_some_and(|p| !sixel || p.encoded.as_ref().is_some_and(|((s, _), _)| *s == size));
+        let has_error = r.error.is_some();
         if let Some(err) = &r.error {
             f.render_widget(Paragraph::new(format!("✕ {err}")).fg(ERROR).wrap(Wrap { trim: true }).centered(), image_area);
         } else if let (true, Some(page)) = (ready, page) {
@@ -2733,7 +3244,12 @@ impl App {
                 center,
             );
         }
-        theme::status_bar(f, status_area, tr!("LEYENDO", "READING"), &info, &[("←→", tr!("página", "page")), ("n/p", tr!("capítulo", "chapter")), ("f", tr!("ajuste", "fit")), ("+/-", "zoom"), ("esc", tr!("volver", "back"))]);
+        let keys = if has_error {
+            vec![("r", tr!("reintentar", "retry")), ("←→", tr!("página", "page")), ("n/p", tr!("capítulo", "chapter")), ("esc", tr!("volver", "back"))]
+        } else {
+            vec![("←→", tr!("página", "page")), ("n/p", tr!("capítulo", "chapter")), ("f", tr!("ajuste", "fit")), ("+/-", "zoom"), ("esc", tr!("volver", "back"))]
+        };
+        theme::status_bar(f, status_area, tr!("LEYENDO", "READING"), &info, &keys);
     }
 }
 
@@ -2791,9 +3307,9 @@ fn spawn_input(tx: mpsc::UnboundedSender<Msg>) {
     });
 }
 
-fn page_cache_path(source: &LoadedSource, chapter: &Chapter, index: usize) -> PathBuf {
+pub fn page_cache_path(source_id: &str, chapter_url: &str, index: usize) -> PathBuf {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (&source.info.id, &chapter.url).hash(&mut h);
+    (source_id, chapter_url).hash(&mut h);
     let dir = paths::pages_cache().join(format!("{:016x}", h.finish()));
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("{index:04}"))
@@ -2832,6 +3348,212 @@ mod tests {
     use crate::model::SourceInfo;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    fn test_source(id: &str) -> LoadedSource {
+        LoadedSource { info: SourceInfo { id: id.into(), name: id.into(), lang: "es".into(), base_url: None, supports_latest: true } }
+    }
+
+    fn test_manga(title: &str) -> Manga {
+        Manga { url: format!("/{title}"), title: title.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn open_group_follows_its_position_when_results_arrive() {
+        let mut app = App::new(Picker::halfblocks());
+        app.query = "blue".into();
+        app.on_search_event(SearchEvent::Results { source: test_source("a"), mangas: vec![test_manga("Blue Lock"), test_manga("Grand Blue")] });
+        let index = app.groups.iter().position(|g| g.key == "grandblue").unwrap();
+        app.group = Some(index);
+        app.on_search_event(SearchEvent::Results { source: test_source("b"), mangas: vec![test_manga("Blue"), test_manga("Blue Exorcist")] });
+        assert_eq!(app.groups[app.group.unwrap()].key, "grandblue");
+    }
+
+    #[test]
+    fn alternatives_put_the_failed_source_last() {
+        let mut app = App::new(Picker::halfblocks());
+        app.query = "grand blue".into();
+        app.on_search_event(SearchEvent::Results { source: test_source("mala"), mangas: vec![test_manga("Grand Blue")] });
+        app.on_search_event(SearchEvent::Results { source: test_source("buena"), mangas: vec![test_manga("Grand Blue")] });
+        app.current = Some((test_source("mala"), test_manga("Grand Blue")));
+        app.details_error = Some("error".into());
+        app.screen = Screen::Manga;
+        app.find_alternatives();
+        assert!(app.screen == Screen::Sources);
+        let entries = &app.groups[app.group.unwrap()].entries;
+        assert_eq!(entries.last().unwrap().0.info.id, "mala");
+    }
+
+    #[test]
+    fn alternatives_say_so_when_no_other_source_has_it() {
+        let mut app = App::new(Picker::halfblocks());
+        app.query = "grand blue".into();
+        app.on_search_event(SearchEvent::Results { source: test_source("mala"), mangas: vec![test_manga("Grand Blue")] });
+        app.current = Some((test_source("mala"), test_manga("Grand Blue")));
+        app.screen = Screen::Manga;
+        app.find_alternatives();
+        assert!(app.screen == Screen::Manga);
+        assert_eq!(app.status, tr!("ninguna otra fuente lo tiene", "no other source has it"));
+    }
+
+    fn app_with_chapters(n: usize) -> App {
+        let mut app = App::new(Picker::halfblocks());
+        app.downloads = Manifest::default();
+        let manga = test_manga("Grand Blue");
+        app.current = Some((test_source("a"), manga.clone()));
+        let chapters = (0..n).map(|i| Chapter { url: format!("/c/{i}"), name: format!("Cap {i}"), chapter_number: i as f32, ..Default::default() }).collect();
+        app.screen = Screen::Manga;
+        app.update(Msg::Details(app.generation, Ok(MangaDetails { manga, chapters })));
+        app
+    }
+
+    #[test]
+    fn extensions_show_why_they_failed_to_load() {
+        let mut app = App::new(Picker::halfblocks());
+        app.installed = vec![Installed { pkg: "p".into(), name: "Rota".into(), version_code: 1, version_name: "1.0".into(), content_warning: 1, langs: vec!["es".into()] }];
+        app.load_errors = vec![("Rota".into(), "java.lang.NoClassDefFoundError: android/webkit/Foo".into())];
+        app.screen = Screen::Extensions;
+        let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("✕") && text.contains("Android"), "{text}");
+    }
+
+    #[test]
+    fn retry_asks_again_for_the_failed_page() {
+        let mut app = App::new(Picker::halfblocks());
+        app.screen = Screen::Reader;
+        app.reader = Some(Reader {
+            source: test_source("a"),
+            manga_url: "/m".into(),
+            manga: test_manga("M"),
+            chapters: vec![Chapter { url: "/c".into(), ..Default::default() }],
+            chapter: 0,
+            pages: vec![serde_json::from_str(r#"{"index":0,"url":"/p"}"#).unwrap()],
+            page: 0,
+            requested: HashSet::from([0]),
+            images: HashMap::new(),
+            error: Some("error".into()),
+            view: View::default(),
+        });
+        app.key_reader(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        let r = app.reader.as_ref().unwrap();
+        assert!(r.error.is_none() && !r.requested.contains(&0));
+    }
+
+    #[test]
+    fn download_prompt_counts_chapters_and_toggles_format() {
+        let mut app = app_with_chapters(3);
+        app.prefs.download_format = download::Format::Cbz;
+        app.key_manga(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        assert!(app.chapter_input.as_ref().is_some_and(|i| i.kind == ChapterInputKind::Download));
+        app.key_manga(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.prefs.download_format, download::Format::Folder);
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains(&trf!("descargar {} capítulos", "download {} chapters", 3)), "{text}");
+
+        app.key_manga(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.chapter_input.is_none());
+    }
+
+    #[test]
+    fn download_progress_shows_and_clears() {
+        let mut app = app_with_chapters(1);
+        app.on_download_event(download::Event::Progress { chapter: 1, chapters: 2, name: "Cap 0".into(), page: 3, pages: 10 });
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("3/10"), "{text}");
+
+        app.download_cancel = Some(Arc::default());
+        app.on_download_event(download::Event::Finished(download::Summary { saved: 1, ..Default::default() }));
+        assert!(app.download_progress.is_none() && app.download_cancel.is_none());
+        assert_eq!(app.status, trf!("✓ {} capítulos guardados", "✓ {} chapters saved", 1));
+    }
+
+    #[test]
+    fn a_download_does_not_redraw_the_reader() {
+        let mut app = App::new(Picker::halfblocks());
+        app.screen = Screen::Reader;
+        app.dirty = false;
+        app.update(Msg::Download(download::Event::Progress { chapter: 1, chapters: 1, name: "c".into(), page: 1, pages: 2 }));
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn m_asks_for_the_next_batch_keeping_the_results() {
+        let mut app = App::new(Picker::halfblocks());
+        app.screen = Screen::Search;
+        app.on_search_event(SearchEvent::Results { source: test_source("a"), mangas: vec![test_manga("Grand Blue")] });
+        app.search_rest = (0..health::BATCH_SIZE + 5).map(|i| test_source(&format!("s{i}"))).collect();
+
+        app.key_search(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.search_rest.len(), 5);
+        assert_eq!(app.groups.len(), 1);
+
+        app.key_search(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(app.search_rest.is_empty());
+
+        app.key_search(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.status, tr!("ya has buscado en todas las fuentes", "you've already searched every source"));
+    }
+
+    #[test]
+    fn m_waits_for_the_current_batch() {
+        let mut app = App::new(Picker::halfblocks());
+        app.screen = Screen::Search;
+        app.pending = 3;
+        app.search_rest = vec![test_source("a")];
+        app.key_search(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.search_rest.len(), 1);
+    }
+
+    #[test]
+    fn alternatives_search_the_next_batch_before_giving_up() {
+        let mut app = App::new(Picker::halfblocks());
+        app.query = "grand blue".into();
+        app.on_search_event(SearchEvent::Results { source: test_source("mala"), mangas: vec![test_manga("Grand Blue")] });
+        app.search_rest = vec![test_source("otra")];
+        app.current = Some((test_source("mala"), test_manga("Grand Blue")));
+        app.screen = Screen::Manga;
+        app.find_alternatives();
+        assert!(app.screen == Screen::Search);
+        assert!(app.search_rest.is_empty());
+    }
+
+    #[test]
+    fn failed_sources_can_be_listed_from_the_search() {
+        let mut app = App::new(Picker::halfblocks());
+        app.screen = Screen::Search;
+        let f_key = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE);
+        app.key_search(f_key);
+        assert!(app.screen == Screen::Search, "sin fallos no hay panel");
+
+        app.on_search_event(SearchEvent::Failed { source: test_source("a"), error: "error 500".into() });
+        app.key_search(f_key);
+        assert!(app.screen == Screen::SourceIssues);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("error 500"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_manga_shows_the_error_instead_of_spinning() {
+        let mut app = App::new(Picker::halfblocks());
+        app.current = Some((test_source("a"), test_manga("Grand Blue")));
+        app.screen = Screen::Manga;
+        assert!(app.animated(), "cargando");
+        app.update(Msg::Details(app.generation, Err(anyhow::anyhow!("eu.kanade.tachiyomi.network.HttpException: HTTP error 500"))));
+        assert!(!app.animated(), "ya no carga nada");
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("500") && !text.contains(tr!("cargando capítulos", "loading chapters")), "{text}");
+    }
 
     fn fake_favorite(title: &str, status: Status, progress: i32, linked: bool, synced: bool) -> Favorite {
         Favorite {

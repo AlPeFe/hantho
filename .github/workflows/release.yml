@@ -1,0 +1,68 @@
+name: Release
+
+# Al subir una etiqueta (git tag v0.2.0 && git push origin v0.2.0) publica binarios para Linux y Windows.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Crear la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes
+
+  build:
+    needs: create
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            exe: hantho
+            archive: hantho-linux-x86_64.tar.gz
+          - os: windows-latest
+            exe: hantho.exe
+            archive: hantho-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Compilar
+        run: |
+          (cd ext-host && ./gradlew installDist --no-daemon)
+          (cd reader && cargo build --release)
+
+      # El binario encuentra solo ext-host/lib a su lado
+      - name: Empaquetar
+        run: |
+          mkdir -p dist/hantho/ext-host
+          cp "reader/target/release/${{ matrix.exe }}" README.md README.es.md LICENSE dist/hantho/
+          cp -r ext-host/build/install/ext-host/lib dist/hantho/ext-host/lib
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "${{ matrix.archive }}" hantho
+          else
+            tar czf "${{ matrix.archive }}" hantho
+          fi
+
+      - name: Subir
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "dist/${{ matrix.archive }}"

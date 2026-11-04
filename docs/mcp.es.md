@@ -12,7 +12,7 @@ tu biblioteca, marcar capítulos y **abrir el lector en un panel al lado del cha
 
 | Herramienta | Qué hace |
 |---|---|
-| `search_manga` | Busca un título en todas las fuentes instaladas a la vez (hasta ~25 s); por defecto, solo en los idiomas elegidos en la TUI |
+| `search_manga` | Busca un título en las fuentes instaladas (con más de 20, en una primera tanda de las más fiables; `all_sources` busca en todas); por defecto, solo en los idiomas elegidos en la TUI |
 | `library` | Tus favoritos con estado, progreso, último capítulo y vínculo con AniList |
 | `chapters` | Capítulos de un manga, con cuáles están leídos (`from`, `to`, `unread_only`, `limit`) |
 | `mark_read` | Marca o desmarca un capítulo, o todos hasta un número; actualiza AniList si está vinculado |

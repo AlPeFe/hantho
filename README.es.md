@@ -40,12 +40,15 @@ que tú añadas), muestra las páginas como imágenes de verdad
 ## Funciones
 
 - 🌸 **TUI** con tema rosa pastel, pantalla de inicio animada, biblioteca, extensiones y AniList.
-- 🔎 **Búsqueda global** en todas las fuentes instaladas en paralelo (≈165 fuentes en español en ~25 s),
-  con resultados agrupados por obra.
+- 🔎 **Búsqueda global** en las fuentes instaladas, con resultados agrupados por obra a medida que llegan.
+  Con más de 20 busca por tandas: primero las de tus favoritos y las más fiables, y `m` amplía a las siguientes.
 - 📖 **Lector** con imágenes Sixel o Kitty; fallback a bloques de color si la terminal no tiene gráficos.
   Ajuste a página entera, al ancho (ideal para webtoons), al alto o tamaño original, y zoom hasta el 400 %.
   Precarga de páginas siguientes.
+- ⬇ **Descargas**: guarda capítulos como `.cbz` o carpetas de imágenes en una carpeta local, una unidad de red
+  o un remoto de [rclone](https://rclone.org) (SFTP, WebDAV, S3, Google Drive…). Despacio, para no castigar a las fuentes.
 - 💗 **Biblioteca**: favoritos, estado de lectura (leyendo, en pausa, completado…), "continuar" donde lo dejaste.
+  `u` comprueba si hay capítulos nuevos en lo que estás leyendo y marca cuántos te quedan (`+3`).
 - ✓ **Capítulos leídos**: se marcan solos al terminar un capítulo y se ven apagados en la lista; en mangas
   de mil capítulos, filtra (`/`), salta a un número (`#`) o avanza de cien en cien.
 - 🧩 **Extensiones**: como en Mihon, Han Thỏ no trae ninguna. Añades el repositorio que quieras y
@@ -56,7 +59,11 @@ que tú añadas), muestra las páginas como imágenes de verdad
   extensiones que falten) y exporta tu biblioteca para restaurarla en Mihon.
 - 🤖 **Servidor MCP**: Claude Code, Codex y otros agentes pueden buscar, consultar tu biblioteca, marcar
   capítulos y abrir el lector en un panel al lado del chat ([`docs/mcp.es.md`](docs/mcp.es.md)).
-- 🐢 **Respetuoso con los servicios**: rate limiting y caché tanto para AniList como para las fuentes.
+- 🩺 **Salud de las fuentes**: recuerda qué fuentes fallan y por qué, deja de esperar a las rotas durante un
+  tiempo (se reintentan solas) y, si un manga no abre o no tiene capítulos, `s` lo busca en otras.
+  `hantho search --all` consulta todas igualmente, para poder diagnosticar.
+- 🐢 **Respetuoso con los servicios**: rate limiting y caché para AniList y las fuentes. Como mucho 8 búsquedas
+  a la vez y una por dominio, y si una web responde 429 se deja de consultar.
 - 🌐 **Español e inglés**: usa el idioma del sistema (español si está en español; inglés en cualquier otro caso).
 - 🐧🪟 **Linux y Windows**, probado en CI en ambos.
 
@@ -94,7 +101,7 @@ que tú añadas), muestra las páginas como imágenes de verdad
 
 ## Instalación
 
-Por ahora se compila desde el código. Son dos piezas: `ext-host` (Kotlin) y `reader` (Rust).
+Se compila desde el código. Son dos piezas: `ext-host` (Kotlin) y `reader` (Rust).
 El reader encuentra y lanza el host solo.
 
 ### Linux
@@ -160,7 +167,9 @@ Desde la línea de comandos, sin TUI:
 
 | Comando | Qué hace |
 |---|---|
-| `hantho search "grand blue" [--lang es]` | Busca en todas las fuentes instaladas |
+| `hantho search "grand blue" [--lang es] [--all]` | Busca en las fuentes instaladas (`--all`: en todas, sin tandas y también en las omitidas por sus fallos) |
+| `hantho updates` | Comprueba si hay capítulos nuevos en los mangas que estás leyendo |
+| `hantho download "título" --chapter N \| --from N --until M \| --unread \| --all [--dest D] [--format cbz\|folder] [--force]` | Descarga capítulos (también con `--source` y `--url`) |
 | `hantho ext repo add\|remove <url>` / `ext repo list` | Gestiona tus repositorios de extensiones |
 | `hantho ext update` | Descarga el catálogo más reciente de tus repositorios y avisa si hay versiones nuevas |
 | `hantho ext upgrade` | Actualiza todas las extensiones instaladas que tengan versión nueva |
@@ -182,13 +191,14 @@ En todas las listas funcionan `↑`/`↓` y `k`/`j`; `esc` o `q` vuelve atrás; 
 | Inicio | `1`–`7` o `enter` elegir · `/` buscar · `q` salir |
 | Extensiones | `U` actualizar todas las que tengan versión nueva · `a` añadir. La TUI comprueba si hay versiones nuevas al arrancar (descarga el catálogo si tiene más de un día) y lo indica en el menú |
 | Añadir extensiones | `enter` instalar, actualizar o quitar · `/` filtrar · `l` idioma · `n` ocultar NSFW · `r` añadir repositorio · `u` actualizar catálogo |
-| Biblioteca | `enter` abrir · `d` quitar · `/` buscar |
-| Búsqueda | escribe y pulsa `enter` · `tab`/`↓` ir a resultados · `/` editar · `b` biblioteca · `ctrl+L` (o `l` fuera del cuadro) idioma de las fuentes: por defecto el del sistema + inglés; se recuerda |
-| Manga | `enter` leer · `c` continuar · `f` favorito · `e` estado · `a` vincular/sincronizar AniList · `A` re-vincular · `r` recargar |
+| Biblioteca | `enter` abrir · `u` comprobar capítulos nuevos · `d` quitar · `/` buscar |
+| Búsqueda | escribe y pulsa `enter` · `tab`/`↓` ir a resultados · `/` editar · `b` biblioteca · `f` fuentes que han fallado · `m` buscar en la siguiente tanda de fuentes · `ctrl+L` (o `l` fuera del cuadro) idioma de las fuentes: por defecto el del sistema + inglés; se recuerda |
+| Fuentes con problemas | `r` reintentar · `R` reintentar todas · `d` activar o desactivar · `U` actualizar extensiones |
+| Manga | `enter` leer · `s` buscarlo en otras fuentes · `d` descargar el capítulo · `D` descargar todos los visibles que falten (pregunta el destino; `tab` cambia el formato) · `X` cancelar la descarga · `c` continuar · `f` favorito · `e` estado · `a` vincular/sincronizar AniList · `A` re-vincular · `r` recargar (con más margen de espera) |
 | Capítulos | `m` marcar/desmarcar leído · `M` marcar este y los anteriores · `/` filtrar · `#` ir al capítulo N · `[`/`]` ±100 · `g`/`G` primero/último · `o` invertir orden |
 | Backup Mihon | `enter` exportar o importar el archivo elegido · `r` buscar archivos de nuevo |
 | AniList | `l` iniciar sesión · `o` cerrar sesión · `d` registrar la app (solo si falta el client ID) |
-| Lector | `→` `espacio` `l` siguiente · `←` `h` anterior · `n`/`p` capítulo siguiente/anterior · `g`/`G` primera/última página · `f` ajuste (página, ancho, alto, original; se recuerda por manga) · `+`/`-` zoom · `0` quitar zoom. Si la página no cabe, las flechas (`hjkl`) primero la recorren y al llegar al borde pasan de página |
+| Lector | `→` `espacio` `l` siguiente · `←` `h` anterior · `n`/`p` capítulo siguiente/anterior · `g`/`G` primera/última página · `f` ajuste (página, ancho, alto, original; se recuerda por manga) · `+`/`-` zoom · `0` quitar zoom · `r` reintentar si ha fallado. Si la página no cabe, las flechas (`hjkl`) primero la recorren y al llegar al borde pasan de página |
 
 ### Variables de entorno
 
@@ -199,11 +209,29 @@ En todas las listas funcionan `↑`/`↓` y `k`/`j`; `esc` o `q` vuelve atrás; 
 | `HANTHO_PROTOCOL` | Forzar `sixel`, `kitty`, `iterm2` o `halfblocks` |
 | `HANTHO_FONT` | Tamaño de celda en píxeles, p. ej. `10x20`, si la detección falla |
 | `HANTHO_HOST_LIB` | Ruta a `ext-host/lib` si el binario no está dentro del repo |
+| `HANTHO_RCLONE` | Ruta de `rclone` si no está en el `PATH` |
 | `HANTHO_ANILIST_CLIENT_ID` | Client ID de AniList propio (solo si tu binario no trae uno) |
 | `JAVA_HOME` | JVM a usar (si no, `java` del `PATH`) |
 
 > El proyecto antes se llamaba *mangaterm*. Si tienes datos en `~/.mangaterm`, se mueven solos a
 > `~/.hantho` la primera vez que abras `hantho`.
+
+## Descargas
+
+```bash
+hantho download "Grand Blue" --from 1 --until 10 --dest D:\Manga
+hantho download "Grand Blue" --unread --dest rclone:nas:manga --format folder
+```
+
+Cada capítulo queda en `<destino>/<manga>/<capítulo>.cbz`. El destino y el formato se recuerdan.
+
+- **Local o unidad de red:** cualquier carpeta, también montada (`\\nas\manga`, `/mnt/nas`).
+- **Remoto:** `rclone:<remoto>:<ruta>`. Hay que [instalar rclone](https://rclone.org/install) y configurar el remoto con `rclone config`.
+- **Lo ya descargado no se repite.** Si hay errores, el capítulo no se guarda a medias. La excepción son imágenes
+  sueltas que ya no existen en la web (404): se saltan y se avisa, hasta un 10 % del capítulo.
+- **Despacio:** un capítulo a la vez y dos páginas a la vez. Si la fuente responde 429, o fallan tres capítulos seguidos, se para.
+
+Descarga solo contenido para uso personal y respeta los derechos de autor (ver *Aviso legal*).
 
 ## AniList
 
@@ -294,12 +322,11 @@ Más detalles técnicos en [`NOTES.md`](NOTES.md).
 
 - **Cloudflare.** Las fuentes protegidas por el desafío de Cloudflare no funcionan: en Android se
   resuelven con un WebView, y aquí no hay. En las pruebas, ~12 de 165 fuentes en español fallaron por esto.
-- **Shims de Android incompletos.** Algunas extensiones usan clases que todavía no están
-  (`android.webkit.CookieManager`, `android.util.LruCache`, `android.graphics.ColorMatrix`,
-  `Uri.Builder`, `Dispatchers.Main`…) y fallan al cargar o al buscar.
+- **Shims de Android incompletos.** Algunas extensiones usan clases que todavía no están y fallan al
+  cargar o al buscar. La pantalla de Extensiones muestra el error de las que no cargan.
 - **Sin pantalla de ajustes de extensiones.** Las preferencias de cada fuente quedan en sus valores
   por defecto.
-- **Sin descargas offline** ni aviso de capítulos nuevos (por ahora).
+- **Las descargas no se leen desde Han Thỏ** todavía: se abren con cualquier lector de CBZ.
 - **Panel lateral del MCP**: necesita una terminal que se pueda dividir (Windows Terminal, tmux, WezTerm,
   zellij o kitty); si no, el lector se abre en una ventana nueva.
 - **macOS** no está probado; debería funcionar, pero no hay CI.

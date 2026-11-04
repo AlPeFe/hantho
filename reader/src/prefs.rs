@@ -1,6 +1,7 @@
 //! Preferencias que se recuerdan entre sesiones (`~/.hantho/prefs.json`): el ajuste del lector y
 //! los idiomas en los que buscar. Las comparten la TUI y el servidor MCP.
 
+use crate::download;
 use crate::paths;
 use crate::render::Fit;
 use serde::{Deserialize, Serialize};
@@ -16,11 +17,16 @@ pub struct Prefs {
     /// Idiomas de las fuentes en las que buscar (vacío = todos).
     #[serde(default = "default_langs")]
     pub search_langs: Vec<String>,
+    /// Dónde guardar las descargas: una carpeta o `rclone:<remoto>:<ruta>`.
+    #[serde(default)]
+    pub download_dest: Option<String>,
+    #[serde(default)]
+    pub download_format: download::Format,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { fit: Fit::default(), manga_fit: HashMap::new(), search_langs: default_langs() }
+        Prefs { fit: Fit::default(), manga_fit: HashMap::new(), search_langs: default_langs(), download_dest: None, download_format: download::Format::default() }
     }
 }
 
@@ -42,8 +48,7 @@ impl Prefs {
 
     pub fn save(&self) {
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::create_dir_all(paths::home());
-            let _ = std::fs::write(paths::prefs_file(), json);
+            let _ = paths::write_atomic(&paths::prefs_file(), &json);
         }
     }
 
@@ -55,6 +60,10 @@ impl Prefs {
         self.fit = fit;
         self.manga_fit.insert(manga_key, fit);
         self.save();
+    }
+
+    pub fn download_dest(&self) -> String {
+        self.download_dest.clone().unwrap_or_else(download::default_dest)
     }
 
     /// Texto para mostrar el filtro de idiomas ("es + en", o "todos").

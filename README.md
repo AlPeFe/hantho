@@ -40,12 +40,15 @@ progress to [AniList](https://anilist.co).
 ## Features
 
 - 🌸 **TUI** with a pastel-pink theme, animated home screen, library, extensions and AniList.
-- 🔎 **Global search** across every installed source in parallel (≈165 Spanish sources in ~25 s),
-  with results grouped by title.
+- 🔎 **Global search** across your installed sources, with results grouped by title as they arrive.
+  With more than 20 it searches in batches: your favorites' sources and the most reliable first, and `m` moves on to the next.
 - 📖 **Reader** with Sixel or Kitty images; falls back to colored blocks if the terminal has no graphics.
   Fit the whole page, the width (great for webtoons), the height or the original size, and zoom up to 400%.
   Upcoming pages are preloaded.
+- ⬇ **Downloads**: saves chapters as `.cbz` files or image folders to a local folder, a network drive or an
+  [rclone](https://rclone.org) remote (SFTP, WebDAV, S3, Google Drive…). Slowly, to go easy on the sources.
 - 💗 **Library**: favorites, reading status (reading, paused, completed…), "continue" where you left off.
+  `u` checks for new chapters in what you're reading and marks how many are left (`+3`).
 - ✓ **Read chapters**: marked automatically when you finish a chapter and dimmed in the list; for manga
   with a thousand chapters, filter (`/`), jump to a number (`#`) or move a hundred at a time.
 - 🧩 **Extensions**: like Mihon, Han Thỏ ships none. Add the repository you want, then in
@@ -56,7 +59,11 @@ progress to [AniList](https://anilist.co).
   get installed automatically) and export your library to restore it in Mihon.
 - 🤖 **MCP server**: Claude Code, Codex and other agents can search, browse your library, mark chapters
   and open the reader in a pane next to the chat ([`docs/mcp.md`](docs/mcp.md)).
-- 🐢 **Polite to services**: rate limiting and caching for both AniList and the sources.
+- 🩺 **Source health**: remembers which sources fail and why, stops waiting for broken ones for a while
+  (they're retried on their own) and, if a manga won't open or has no chapters, `s` looks for it in others.
+  `hantho search --all` queries them all anyway, so you can diagnose.
+- 🐢 **Polite to services**: rate limiting and caching for AniList and the sources. At most 8 searches at once
+  and one per domain, and a site answering 429 stops being queried.
 - 🌐 **English and Spanish**: follows the system language (Spanish if the system is in Spanish, English
   otherwise).
 - 🐧🪟 **Linux and Windows**, both tested in CI.
@@ -160,7 +167,9 @@ From the command line, without the TUI:
 
 | Command | What it does |
 |---|---|
-| `hantho search "grand blue" [--lang en]` | Search every installed source |
+| `hantho search "grand blue" [--lang en] [--all]` | Search installed sources (`--all`: all of them, no batches, also those skipped for failing) |
+| `hantho updates` | Check for new chapters in the manga you're reading |
+| `hantho download "title" --chapter N \| --from N --until M \| --unread \| --all [--dest D] [--format cbz\|folder] [--force]` | Download chapters (also with `--source` and `--url`) |
 | `hantho ext repo add\|remove <url>` / `ext repo list` | Manage your extension repositories |
 | `hantho ext update` | Download the latest catalog from your repositories and say if there are new versions |
 | `hantho ext upgrade` | Update every installed extension that has a new version |
@@ -182,13 +191,14 @@ Every list supports `↑`/`↓` and `k`/`j`; `esc` or `q` goes back; `ctrl+c` qu
 | Home | `1`–`7` or `enter` choose · `/` search · `q` quit |
 | Extensions | `U` update every one with a new version · `a` add more. The TUI checks for new versions on startup (downloading the catalog if it's over a day old) and shows it in the menu |
 | Add extensions | `enter` install, update or remove · `/` filter · `l` language · `n` hide NSFW · `r` add repository · `u` update catalog |
-| Library | `enter` open · `d` remove · `/` search |
-| Search | type and press `enter` · `tab`/`↓` go to results · `/` edit · `b` library · `ctrl+L` (or `l` outside the box) source language: system language + English by default; remembered |
-| Manga | `enter` read · `c` continue · `f` favorite · `e` status · `a` link/sync AniList · `A` re-link · `r` reload |
+| Library | `enter` open · `u` check for new chapters · `d` remove · `/` search |
+| Search | type and press `enter` · `tab`/`↓` go to results · `/` edit · `b` library · `f` sources that failed · `m` search the next batch of sources · `ctrl+L` (or `l` outside the box) source language: system language + English by default; remembered |
+| Sources with problems | `r` retry · `R` retry all · `d` enable or disable · `U` update extensions |
+| Manga | `enter` read · `s` look for it in other sources · `d` download the chapter · `D` download all visible ones still missing (asks for the destination; `tab` changes the format) · `X` cancel the download · `c` continue · `f` favorite · `e` status · `a` link/sync AniList · `A` re-link · `r` reload (waits longer) |
 | Chapters | `m` mark/unmark read · `M` mark this one and all before · `/` filter · `#` go to chapter N · `[`/`]` ±100 · `g`/`G` first/last · `o` reverse order |
 | Mihon backup | `enter` export, or import the selected file · `r` look for files again |
 | AniList | `l` log in · `o` log out · `d` register the app (only if the client ID is missing) |
-| Reader | `→` `space` `l` next · `←` `h` previous · `n`/`p` next/previous chapter · `g`/`G` first/last page · `f` fit (page, width, height, original; remembered per manga) · `+`/`-` zoom · `0` reset zoom. When the page doesn't fit, the arrows (`hjkl`) scroll it first and turn the page at the edge |
+| Reader | `→` `space` `l` next · `←` `h` previous · `n`/`p` next/previous chapter · `g`/`G` first/last page · `f` fit (page, width, height, original; remembered per manga) · `+`/`-` zoom · `0` reset zoom · `r` retry if it failed. When the page doesn't fit, the arrows (`hjkl`) scroll it first and turn the page at the edge |
 
 ### Environment variables
 
@@ -199,11 +209,29 @@ Every list supports `↑`/`↓` and `k`/`j`; `esc` or `q` goes back; `ctrl+c` qu
 | `HANTHO_PROTOCOL` | Force `sixel`, `kitty`, `iterm2` or `halfblocks` |
 | `HANTHO_FONT` | Cell size in pixels, e.g. `10x20`, if detection fails |
 | `HANTHO_HOST_LIB` | Path to `ext-host/lib` if the binary isn't inside the repo |
+| `HANTHO_RCLONE` | Path to `rclone` if it isn't on the `PATH` |
 | `HANTHO_ANILIST_CLIENT_ID` | Your own AniList client ID (only if your binary doesn't ship one) |
 | `JAVA_HOME` | JVM to use (otherwise `java` from `PATH`) |
 
 > The project used to be called *mangaterm*. If you have data in `~/.mangaterm`, it's moved to
 > `~/.hantho` automatically the first time you run `hantho`.
+
+## Downloads
+
+```bash
+hantho download "Grand Blue" --from 1 --until 10 --dest D:\Manga
+hantho download "Grand Blue" --unread --dest rclone:nas:manga --format folder
+```
+
+Each chapter ends up in `<destination>/<manga>/<chapter>.cbz`. Destination and format are remembered.
+
+- **Local or network drive:** any folder, mounted ones too (`\\nas\manga`, `/mnt/nas`).
+- **Remote:** `rclone:<remote>:<path>`. You need to [install rclone](https://rclone.org/install) and set up the remote with `rclone config`.
+- **What's already downloaded isn't repeated.** If there are errors, the chapter is never saved half-done. The
+  exception is loose images that no longer exist on the site (404): they're skipped and reported, up to 10% of the chapter.
+- **Slowly:** one chapter at a time and two pages at a time. If the source answers 429, or three chapters in a row fail, it stops.
+
+Download only for personal use and respect copyright (see *Legal notice*).
 
 ## AniList
 
@@ -294,11 +322,10 @@ More technical details in [`NOTES.md`](NOTES.md) (in Spanish).
 
 - **Cloudflare.** Sources behind Cloudflare's challenge don't work: on Android they're solved with a
   WebView, and there's none here. In testing, ~12 of 165 Spanish sources failed because of this.
-- **Incomplete Android shims.** Some extensions use classes that aren't there yet
-  (`android.webkit.CookieManager`, `android.util.LruCache`, `android.graphics.ColorMatrix`,
-  `Uri.Builder`, `Dispatchers.Main`…) and fail to load or to search.
+- **Incomplete Android shims.** Some extensions use classes that aren't there yet and fail to load or
+  search. The Extensions screen shows the error for those that don't load.
 - **No extension settings screen.** Each source's preferences stay at their defaults.
-- **No offline downloads** and no new-chapter notifications (yet).
+- **Downloads can't be read from Han Thỏ** yet: open them with any CBZ reader.
 - **MCP side pane**: needs a terminal that can split (Windows Terminal, tmux, WezTerm, zellij or
   kitty); otherwise the reader opens in a new window.
 - **macOS** is untested; it should work, but there's no CI for it.

@@ -30,8 +30,7 @@ pub fn list() -> Vec<Installed> {
 }
 
 fn save(list: &[Installed]) -> Result<()> {
-    std::fs::create_dir_all(paths::extensions_dir())?;
-    std::fs::write(paths::installed_file(), serde_json::to_vec_pretty(list)?)?;
+    paths::write_atomic(&paths::installed_file(), &serde_json::to_vec_pretty(list)?)?;
     Ok(())
 }
 
@@ -46,14 +45,15 @@ pub async fn install(ext: &Extension) -> Result<Installed> {
         content_warning: ext.content_warning,
         langs: ext.langs().into_iter().map(String::from).collect(),
     };
-    std::fs::create_dir_all(paths::extensions_dir())?;
-    std::fs::write(item.jar_path(), &bytes)?;
+    paths::write_atomic(&item.jar_path(), &bytes)?;
 
     let mut all = list();
     all.retain(|i| i.pkg != item.pkg);
     all.push(item.clone());
     all.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     save(&all)?;
+    // Una versión nueva puede arreglar lo que fallaba: darle otra oportunidad a sus fuentes
+    crate::health::Health::update(|h| ext.sources.iter().for_each(|s| h.forgive(&s.id.to_string())));
     Ok(item)
 }
 

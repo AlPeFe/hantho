@@ -49,6 +49,24 @@ que ejecuta las extensiones de Mihon/Keiyoushi.
   - `Dispatchers.Main` no disponible (3): falta un dispatcher Main en la JVM.
   - `android.net.Uri.buildUpon()` / `Uri.Builder` (2) y un campo de `android.os.Build`.
 
+## Salud de las fuentes (`reader/src/health.rs`, `~/.hantho/source_health.json`)
+- Fallos seguidos por separado al buscar y al abrir: una fuente puede buscar bien y no dejar leer nada.
+- Se omite en la búsqueda (salvo `hantho search --all`) tras 3 fallos seguidos, con espera creciente:
+  red/timeout 30 min–6 h, Cloudflare/dominio muerto 6 h–3 días, HTTP/otros 1 h–1 día. Si falta una API de
+  Android, tras 2 fallos y hasta 30 días o una versión nueva de Han Thỏ. Un 429, al primero, de 1 h a 1 día.
+  Instalar la extensión borra sus fallos.
+- Tandas: con más de 20 fuentes, cada búsqueda consulta 20 (favoritos, luego sin problemas, luego por latencia);
+  `m` en la TUI pide las 20 siguientes, `all_sources` en MCP y `--all` en la CLI consultan todas.
+- Cada búsqueda: máximo 8 peticiones a la vez y 1 por dominio (`search.rs`). Al vencer los 25 s se libera el hueco,
+  pero la petición sigue en el host hasta su timeout (no hay operación de cancelar).
+- No cuentan: los errores de red si ninguna fuente ha respondido en esa búsqueda (sin conexión), los del propio
+  ext-host, ni un 404/410 al abrir (suele ser de ese manga, no de la fuente).
+- Timeouts al abrir: 20 s (90 s con `r`). Los detalles siguen en segundo plano y se cachean si acaban llegando.
+
+## Capítulos nuevos (`reader/src/news.rs`, `~/.hantho/new_chapters.json`)
+- Solo se comprueba a petición (`u` en la biblioteca, `hantho updates`) y solo lo que está en Leyendo o Releyendo, de dos en dos.
+- Se guardan los capítulos pendientes, no un contador: al leer, el número baja sin volver a consultar la fuente.
+
 ## Render
 - ratatui-image escala con `FilterType::Nearest` y codifica Sixel con Floyd-Steinberg al 0,875, sin opción
   de cambiarlo: en manga produce moiré en las tramas y ruido. Por eso `reader/src/render.rs` hace su propio Sixel:
