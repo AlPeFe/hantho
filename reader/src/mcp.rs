@@ -26,13 +26,13 @@ const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 fn instructions() -> &'static str {
     tr!(
         "Han Thỏ es un lector de manga para la terminal con extensiones de Mihon. \
-Usa search_manga para encontrar un título en todas las fuentes instaladas, library para ver los favoritos del usuario \
+Usa search_manga para encontrar un título en las fuentes instaladas, library para ver los favoritos del usuario \
 con su progreso, chapters para listar capítulos, mark_read para marcar lo leído (actualiza AniList si el manga está \
 vinculado) y open_reader para abrir el lector en un panel al lado del chat. Los identificadores de fuente (source_id) \
 y las URLs (manga_url, chapter_url) salen de search_manga, library o chapters: no los inventes. \
 El usuario usa la aplicación en español.",
         "Han Thỏ is a terminal manga reader with Mihon extensions. \
-Use search_manga to find a title across every installed source, library to see the user's favorites \
+Use search_manga to find a title across the installed sources, library to see the user's favorites \
 with their progress, chapters to list chapters, mark_read to mark what was read (updates AniList if the manga is \
 linked) and open_reader to open the reader in a pane next to the chat. Source ids (source_id) \
 and URLs (manga_url, chapter_url) come from search_manga, library or chapters: don't make them up."
@@ -136,6 +136,17 @@ impl Server {
             None => crate::prefs::Prefs::load().search_langs,
         };
         let sources: Vec<_> = sources.iter().filter(|s| crate::prefs::lang_matches(&langs, &s.info.lang)).cloned().collect();
+        let health = crate::health::Health::load();
+        let (mut sources, skipped) = health.partition(sources, crate::library::now());
+        // De más a menos fiables; sin `all_sources`, solo la primera tanda
+        let mut remaining = 0;
+        if !args["all_sources"].as_bool().unwrap_or(false) {
+            let library = crate::library::Library::load();
+            let favorites = library.favorites.iter().map(|f| f.source_id.as_str()).collect();
+            let (first, rest) = health.first_batch(sources, &favorites);
+            sources = first;
+            remaining = rest.len();
+        }
 
         let mut groups: Vec<(String, String, Vec<Value>)> = Vec::new(); // (clave, título, fuentes)
         let mut failed = 0;
@@ -160,7 +171,7 @@ impl Server {
         let q = search::normalize(query);
         groups.sort_by_key(|(k, _, s)| (if *k == q { 0 } else if k.starts_with(&q) { 1 } else if k.contains(&q) { 2 } else { 3 }, std::cmp::Reverse(s.len())));
         let results: Vec<Value> = groups.into_iter().take(limit).map(|(_, title, sources)| json!({ "title": title, "sources": sources })).collect();
-        Ok(pretty(&json!({ "query": query, "results": results, "failed_sources": failed })))
+        Ok(pretty(&json!({ "query": query, "results": results, "failed_sources": failed, "skipped_sources": skipped.len(), "remaining_sources": remaining })))
     }
 
     async fn chapters(&self, args: &Value) -> Result<String> {
@@ -436,11 +447,12 @@ fn tools() -> Value {
         {
             "name": "search_manga",
             "title": tr!("Buscar manga", "Search manga"),
-            "description": tr!("Busca un manga por título en todas las fuentes instaladas a la vez (tarda hasta ~25 s). Devuelve los títulos agrupados con las fuentes donde aparecen.", "Search a manga by title across every installed source at once (takes up to ~25 s). Returns titles grouped with the sources they appear in."),
+            "description": tr!("Busca un manga por título en las fuentes instaladas. Con muchas, solo en una primera tanda de las más fiables: si no aparece y remaining_sources es mayor que 0, repite con all_sources. Devuelve los títulos agrupados con las fuentes donde aparecen.", "Search a manga by title across the installed sources. With many, only in a first batch of the most reliable: if it doesn't show up and remaining_sources is above 0, repeat with all_sources. Returns titles grouped with the sources they appear in."),
             "inputSchema": { "type": "object", "properties": {
                 "query": { "type": "string", "description": tr!("Título a buscar", "Title to search for") },
                 "lang": { "type": "string", "description": tr!("Solo fuentes de este idioma (p. ej. es, en); si no se indica, los idiomas elegidos en la TUI", "Only sources in this language (e.g. en, es); if omitted, the languages chosen in the TUI") },
-                "limit": { "type": "integer", "description": tr!("Máximo de títulos (por defecto 15)", "Maximum number of titles (default 15)") }
+                "limit": { "type": "integer", "description": tr!("Máximo de títulos (por defecto 15)", "Maximum number of titles (default 15)") },
+                "all_sources": { "type": "boolean", "description": tr!("Buscar en todas las fuentes, no solo en la primera tanda (hace muchas más peticiones)", "Search every source, not just the first batch (makes many more requests)") }
             }, "required": ["query"] },
             "annotations": { "readOnlyHint": true, "openWorldHint": true }
         },

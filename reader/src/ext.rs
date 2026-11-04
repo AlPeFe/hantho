@@ -54,6 +54,8 @@ pub async fn install(ext: &Extension) -> Result<Installed> {
     all.push(item.clone());
     all.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     save(&all)?;
+    // Una versión nueva puede arreglar lo que fallaba: darle otra oportunidad a sus fuentes
+    crate::health::Health::update(|h| ext.sources.iter().for_each(|s| h.forgive(&s.id.to_string())));
     Ok(item)
 }
 

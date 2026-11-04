@@ -5,7 +5,9 @@ mod anilist_auth;
 mod backup;
 mod cache;
 mod catalog;
+mod download;
 mod ext;
+mod health;
 mod home;
 mod host;
 mod launch;
@@ -40,6 +42,44 @@ enum Cmd {
         #[arg(help = tr!("Solo fuentes de este idioma (p. ej. es)", "Only sources in this language (e.g. en)"))]
         #[arg(long)]
         lang: Option<String>,
+        #[arg(help = tr!("Consultar todas las fuentes: sin tandas y también las omitidas por sus fallos o desactivadas", "Query every source: no batches, and also those skipped for failing or disabled"))]
+        #[arg(long)]
+        all: bool,
+    },
+    #[command(about = tr!("Descarga capítulos a una carpeta local o remota", "Download chapters to a local or remote folder"))]
+    Download {
+        #[arg(help = tr!("Título de un favorito (o usa --source y --url)", "Title of a favorite (or use --source and --url)"))]
+        query: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(help = tr!("Número de capítulo", "Chapter number"))]
+        #[arg(long)]
+        chapter: Option<f32>,
+        #[arg(help = tr!("Desde el capítulo número", "From chapter number"))]
+        #[arg(long)]
+        from: Option<f32>,
+        #[arg(help = tr!("Hasta el capítulo número", "Up to chapter number"))]
+        #[arg(long)]
+        until: Option<f32>,
+        #[arg(help = tr!("Solo los capítulos sin leer", "Only unread chapters"))]
+        #[arg(long)]
+        unread: bool,
+        #[arg(help = tr!("Todos los capítulos", "Every chapter"))]
+        #[arg(long)]
+        all: bool,
+        #[arg(help = tr!("Carpeta de destino, o rclone:<remoto>:<ruta> (se recuerda)", "Destination folder, or rclone:<remote>:<path> (remembered)"))]
+        #[arg(long)]
+        dest: Option<String>,
+        #[arg(help = tr!("Formato: un .cbz por capítulo o una carpeta de imágenes (se recuerda)", "Format: one .cbz per chapter or a folder of images (remembered)"))]
+        #[arg(long, value_enum)]
+        format: Option<download::Format>,
+        #[arg(help = tr!("Volver a descargar lo que ya esté descargado", "Download again what's already downloaded"))]
+        #[arg(long)]
+        force: bool,
     },
     #[command(about = tr!("Gestiona extensiones", "Manage extensions"))]
     #[command(subcommand)]
@@ -150,7 +190,12 @@ async fn main() -> Result<()> {
     paths::migrate_legacy();
     match cli.cmd {
         None => tui::run(None).await,
-        Some(Cmd::Search { query, lang }) => cli_search(query, lang).await,
+        Some(Cmd::Search { query, lang, all }) => cli_search(query, lang, all).await,
+        Some(Cmd::Download { query, source, url, title, chapter, from, until, unread, all, dest, format, force }) => {
+            let lib = library::Library::load();
+            let target = launch::resolve(&lib, query.as_deref(), source.as_deref(), url.as_deref(), title.as_deref(), tui::ChapterTarget::None)?;
+            cli_download(target, ChapterSelection { chapter, from, until, unread, all }, dest, format, force).await
+        }
         Some(Cmd::Ext(cmd)) => ext_cmd(cmd).await,
         Some(Cmd::Anilist(cmd)) => anilist_cmd(cmd).await,
         Some(Cmd::Backup(cmd)) => backup_cmd(cmd).await,
@@ -257,7 +302,81 @@ async fn anilist_cmd(cmd: AnilistCmd) -> Result<()> {
     Ok(())
 }
 
-async fn cli_search(query: String, lang: Option<String>) -> Result<()> {
+/// Qué capítulos descargar. Hay que pedirlo: nada de bajarse una serie entera por descuido.
+struct ChapterSelection {
+    chapter: Option<f32>,
+    from: Option<f32>,
+    until: Option<f32>,
+    unread: bool,
+    all: bool,
+}
+
+impl ChapterSelection {
+    fn is_empty(&self) -> bool {
+        self.chapter.is_none() && self.from.is_none() && self.until.is_none() && !self.unread && !self.all
+    }
+
+    fn matches(&self, chapter: &model::Chapter, read: bool) -> bool {
+        let n = chapter.chapter_number;
+        self.chapter.is_none_or(|c| n == c) && self.from.is_none_or(|f| n >= f) && self.until.is_none_or(|u| n <= u) && !(self.unread && read)
+    }
+}
+
+async fn cli_download(target: tui::OpenTarget, selection: ChapterSelection, dest: Option<String>, format: Option<download::Format>, force: bool) -> Result<()> {
+    if selection.is_empty() {
+        bail!(tr!("indica qué capítulos: --chapter, --from, --until, --unread o --all", "say which chapters: --chapter, --from, --until, --unread or --all"));
+    }
+    let mut prefs = prefs::Prefs::load();
+    let dest_text = dest.unwrap_or_else(|| prefs.download_dest());
+    let parsed = download::Dest::parse(&dest_text)?;
+    let format = format.unwrap_or(prefs.download_format);
+
+    let host = Host::spawn().await?;
+    let (sources, _) = host.load_all(&ext::list()).await;
+    if !sources.iter().any(|s| s.info.id == target.source_id) {
+        bail!(trf!("la fuente {} no está instalada", "source {} isn't installed", target.source_name));
+    }
+    let manga = model::Manga { url: target.manga_url.clone(), title: target.title.clone(), ..Default::default() };
+    let details = host.details(&target.source_id, &manga, false).await.map_err(|e| anyhow::anyhow!(search::short_error(&e.to_string())))?;
+    let log = reads::ReadLog::load();
+    let key = reads::key(&target.source_id, &target.manga_url);
+    let selected: Vec<usize> = (0..details.chapters.len())
+        .filter(|&i| selection.matches(&details.chapters[i], log.is_read(&key, &details.chapters[i].url)))
+        .collect();
+    if selected.is_empty() {
+        bail!(tr!("ningún capítulo coincide", "no chapters match"));
+    }
+    prefs.download_dest = Some(dest_text.clone());
+    prefs.download_format = format;
+    prefs.save();
+
+    eprintln!("{}", trf!("descargando {} capítulos de {} en {dest_text}…", "downloading {} chapters of {} to {dest_text}…", selected.len(), target.title));
+    let mut job = download::Job::new(&target.source_id, &target.manga_url, &target.title, &details.chapters, &selected, parsed, format);
+    job.force = force;
+    let mut rx = download::start(host, job);
+    let mut summary = download::Summary::default();
+    while let Some(event) = rx.recv().await {
+        match event {
+            download::Event::Progress { .. } => {}
+            download::Event::Saved { place, missing } if missing.is_empty() => println!("✓ {place}"),
+            download::Event::Saved { place, missing } => {
+                println!("{}", trf!("✓ {place} (la web no tiene estas páginas: {missing:?})", "✓ {place} (the site doesn't have these pages: {missing:?})"))
+            }
+            download::Event::Failed { name, error } => eprintln!("✗ {name}: {error}"),
+            download::Event::Finished(s) => summary = s,
+        }
+    }
+    eprintln!("{}", trf!("{} guardados · {} ya estaban · {} fallidos", "{} saved · {} already there · {} failed", summary.saved, summary.skipped, summary.failed));
+    if let Some(reason) = summary.stopped {
+        bail!(reason);
+    }
+    if summary.failed > 0 {
+        bail!(tr!("algunos capítulos no se han podido descargar", "some chapters couldn't be downloaded"));
+    }
+    Ok(())
+}
+
+async fn cli_search(query: String, lang: Option<String>, all: bool) -> Result<()> {
     let installed = ext::list();
     if installed.is_empty() {
         bail!(tr!(
@@ -273,6 +392,19 @@ async fn cli_search(query: String, lang: Option<String>) -> Result<()> {
     }
     if let Some(lang) = &lang {
         sources.retain(|s| &s.info.lang == lang || s.info.lang == "all");
+    }
+    let mut left = 0;
+    if !all {
+        let health = health::Health::load();
+        let (active, skipped) = health.partition(sources, library::now());
+        if !skipped.is_empty() {
+            eprintln!("{}", trf!("{} fuentes omitidas por sus fallos o desactivadas", "{} sources skipped for failing or disabled", skipped.len()));
+        }
+        let library = library::Library::load();
+        let favorites = library.favorites.iter().map(|f| f.source_id.as_str()).collect();
+        let (first, rest) = health.first_batch(active, &favorites);
+        sources = first;
+        left = rest.len();
     }
     eprintln!(
         "{}",
@@ -294,6 +426,9 @@ async fn cli_search(query: String, lang: Option<String>) -> Result<()> {
         }
     }
     eprintln!("{}", trf!("listo en {:.1}s", "done in {:.1}s", started.elapsed().as_secs_f32()));
+    if left > 0 {
+        eprintln!("{}", trf!("quedan {left} fuentes sin consultar (--all para buscar en todas)", "{left} sources not queried (--all to search them all)"));
+    }
     Ok(())
 }
 

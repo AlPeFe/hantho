@@ -7,7 +7,7 @@
 - **¿Una fuente no funciona o falta alguna?** Si también falla en Mihon, el problema es de la extensión:
   repórtalo en [keiyoushi/extensions](https://github.com/keiyoushi/extensions/issues). Si funciona en
   Mihon pero no en Han Thỏ, es nuestro (probablemente falta un *shim* de Android): abre un issue
-  con el nombre de la extensión y el error que muestra `hantho search`.
+  con el nombre de la extensión y el error que muestra `hantho search --all`.
 - Las fuentes con Cloudflare no se pueden usar por ahora (ver *Limitaciones* en el README).
 - No compartas tu token de AniList ni el contenido de `~/.hantho/anilist.json` en un issue.
 

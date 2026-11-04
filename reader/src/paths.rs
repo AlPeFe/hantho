@@ -73,6 +73,16 @@ pub fn http_cache() -> PathBuf {
     home().join("cache").join("api")
 }
 
+/// Qué capítulos se han descargado y dónde.
+pub fn downloads_file() -> PathBuf {
+    home().join("downloads.json")
+}
+
+/// Qué fuentes funcionan y cuáles fallan (ver `health.rs`).
+pub fn source_health_file() -> PathBuf {
+    home().join("source_health.json")
+}
+
 /// Preferencias de la TUI (ajuste del lector, idiomas de búsqueda).
 pub fn prefs_file() -> PathBuf {
     home().join("prefs.json")

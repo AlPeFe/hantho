@@ -12,7 +12,7 @@ mark chapters and **open the reader in a pane next to the chat**.
 
 | Tool | What it does |
 |---|---|
-| `search_manga` | Search a title across every installed source at once (up to ~25 s); by default only in the languages chosen in the TUI |
+| `search_manga` | Search a title across the installed sources (with more than 20, a first batch of the most reliable; `all_sources` searches them all); by default only in the languages chosen in the TUI |
 | `library` | Your favorites with status, progress, last chapter and AniList link |
 | `chapters` | A manga's chapters, showing which are read (`from`, `to`, `unread_only`, `limit`) |
 | `mark_read` | Mark or unmark a chapter, or every chapter up to a number; updates AniList if linked |
